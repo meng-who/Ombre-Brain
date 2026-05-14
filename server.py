@@ -411,6 +411,85 @@ async def dream_hook(request):
         logger.warning(f"Dream hook failed: {e}")
         return PlainTextResponse("")
 
+# =============================================================
+# Frontend REST API endpoints
+# 前端 REST API 端点
+# =============================================================
+
+@mcp.custom_route("/api/pulse", methods=["GET"])
+async def api_pulse(request):
+    from starlette.responses import JSONResponse
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        stats = await bucket_mgr.get_stats()
+        buckets_out = []
+        for b in all_buckets:
+            meta = b.get("metadata", {})
+            score = decay_engine.calculate_score(meta)
+            buckets_out.append({
+                "id": b["id"],
+                "name": meta.get("name", ""),
+                "content": b.get("content", ""),
+                "domain": meta.get("domain", []),
+                "tags": meta.get("tags", []),
+                "importance": meta.get("importance", 5),
+                "valence": meta.get("valence", 0.5),
+                "arousal": meta.get("arousal", 0.5),
+                "weight": round(score, 2),
+                "pinned": bool(meta.get("pinned") or meta.get("protected")),
+                "resolved": bool(meta.get("resolved")),
+                "type": meta.get("type", "dynamic"),
+                "created": meta.get("created", ""),
+                "last_active": meta.get("last_active", ""),
+            })
+        buckets_out.sort(key=lambda x: x["weight"], reverse=True)
+        return JSONResponse({
+            "stats": stats,
+            "buckets": buckets_out,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
+async def api_bucket_detail(request):
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params.get("bucket_id", "")
+    if not bucket_id:
+        return JSONResponse({"error": "缺少 bucket_id"}, status_code=400)
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        target = None
+        for b in all_buckets:
+            if b["id"] == bucket_id:
+                target = b
+                break
+        if not target:
+            return JSONResponse({"error": "桶不存在"}, status_code=404)
+        meta = target.get("metadata", {})
+        score = decay_engine.calculate_score(meta)
+        return JSONResponse({
+            "id": target["id"],
+            "name": meta.get("name", ""),
+            "content": target.get("content", ""),
+            "domain": meta.get("domain", []),
+            "tags": meta.get("tags", []),
+            "importance": meta.get("importance", 5),
+            "valence": meta.get("valence", 0.5),
+            "arousal": meta.get("arousal", 0.5),
+            "weight": round(score, 2),
+            "pinned": bool(meta.get("pinned") or meta.get("protected")),
+            "resolved": bool(meta.get("resolved")),
+            "type": meta.get("type", "dynamic"),
+            "created": meta.get("created", ""),
+            "last_active": meta.get("last_active", ""),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+
+
 
 # =============================================================
 # Internal helper: merge-or-create
