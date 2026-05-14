@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ombre Brain</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=Sora:wght@300;400;500;600;700&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{min-height:100vh;background:linear-gradient(180deg,#08080f,#0c0c1a 40%,#0a0a14);color:#e2e8f0;font-family:'Sora',-apple-system,sans-serif;overflow-x:hidden}
+  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.03)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .mono{font-family:'IBM Plex Mono','SF Mono',monospace}
+  .orb{position:fixed;border-radius:50%;pointer-events:none;z-index:0}
+  .orb-1{top:-20%;right:-10%;width:500px;height:500px;background:radial-gradient(circle,rgba(139,92,246,.04),transparent 70%);animation:breathe 8s ease-in-out infinite}
+  .orb-2{bottom:-10%;left:-10%;width:400px;height:400px;background:radial-gradient(circle,rgba(6,182,212,.03),transparent 70%);animation:breathe 12s ease-in-out infinite 2s}
+  .container{position:relative;z-index:1;max-width:960px;margin:0 auto;padding:40px 20px 60px}
+  .header{margin-bottom:40px;animation:fadeIn .6s ease}
+  .header-row{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+  .status-dot{width:10px;height:10px;border-radius:50%;background:#06b6d4;box-shadow:0 0 12px rgba(6,182,212,.5);animation:pulse 3s ease-in-out infinite}
+  .status-dot.offline{background:#ef4444;box-shadow:0 0 12px rgba(239,68,68,.5)}
+  .title{font-size:28px;font-weight:700;letter-spacing:-.02em;background:linear-gradient(135deg,#e2e8f0,#94a3b8);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .subtitle{font-size:12px;color:rgba(255,255,255,.25);letter-spacing:.05em}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:32px;animation:fadeIn .6s ease .1s both}
+  .stat-card{padding:16px 12px;border-radius:14px;text-align:center;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.04)}
+  .stat-num{font-size:24px;font-weight:700;margin-bottom:4px}
+  .stat-label{font-size:10px;color:rgba(255,255,255,.3);letter-spacing:.08em}
+  .search{width:100%;padding:14px 18px;border-radius:14px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.03);color:#e2e8f0;font-size:14px;font-family:'Sora',sans-serif;outline:none;transition:border-color .3s;margin-bottom:20px;animation:fadeIn .6s ease .15s both}
+  .search::placeholder{color:rgba(255,255,255,.2)}.search:focus{border-color:rgba(6,182,212,.3)}
+  .controls{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:24px;animation:fadeIn .6s ease .2s both}
+  .filters{display:flex;gap:6px;flex-wrap:wrap}
+  .filter-btn{padding:7px 14px;border-radius:10px;border:1px solid transparent;background:transparent;color:rgba(255,255,255,.3);font-size:12px;cursor:pointer;transition:all .2s}
+  .filter-btn.active{border-color:rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:rgba(255,255,255,.8)}
+  .sorts{display:flex;gap:4px}
+  .sort-btn{padding:5px 10px;border-radius:8px;border:none;background:transparent;color:rgba(255,255,255,.2);font-size:10px;cursor:pointer;transition:all .2s;font-family:'IBM Plex Mono',monospace}
+  .sort-btn.active{background:rgba(255,255,255,.06);color:rgba(255,255,255,.6)}
+  .count{font-size:11px;color:rgba(255,255,255,.2);margin-bottom:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+
+  /* Loading */
+  .loading{text-align:center;padding:80px 20px;animation:fadeIn .6s ease}
+  .spinner{width:24px;height:24px;border:2px solid rgba(255,255,255,.1);border-top-color:#06b6d4;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px}
+  .loading-text{font-size:13px;color:rgba(255,255,255,.3)}
+  .error-box{text-align:center;padding:60px 20px;animation:fadeIn .6s ease}
+  .error-text{font-size:14px;color:#f87171;margin-bottom:12px}
+  .error-hint{font-size:12px;color:rgba(255,255,255,.3);line-height:1.8}
+  .retry-btn{margin-top:16px;padding:8px 20px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:rgba(255,255,255,.6);font-size:13px;cursor:pointer}
+
+  /* Card */
+  .card{position:relative;padding:20px 22px;border-radius:16px;cursor:pointer;transition:all .4s cubic-bezier(.4,0,.2,1);animation:fadeIn .5s ease both;overflow:hidden}
+  .card:hover{transform:translateY(-2px)}
+  .card-glow{position:absolute;top:20px;right:20px;width:8px;height:8px;border-radius:50%}
+  .card-status{font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+  .card-domain{font-size:10px;color:rgba(255,255,255,.3)}
+  .card-name{font-size:16px;font-weight:600;color:rgba(255,255,255,.9);margin:10px 0 8px;line-height:1.4;padding-right:20px}
+  .card-desc{font-size:12px;color:rgba(255,255,255,.4);line-height:1.6;margin-bottom:14px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .card-bottom{display:flex;justify-content:space-between;align-items:flex-end}
+  .imp-bar{display:flex;gap:2px;align-items:center}
+  .imp-tick{width:3px;border-radius:1.5px;transition:all .3s}
+  .metrics{display:flex;gap:12px;align-items:center}
+  .v-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+  .metric-text{font-size:10px;color:rgba(255,255,255,.35)}
+  .weight-text{font-size:10px;color:rgba(255,255,255,.25)}
+
+  /* Modal */
+  .overlay{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.7);backdrop-filter:blur(8px)}
+  .overlay.open{display:flex;animation:fadeIn .2s ease}
+  .modal{width:90%;max-width:520px;max-height:85vh;background:#0f0f18;border-radius:24px;padding:32px 28px;overflow:auto}
+  .modal-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px}
+  .modal-status{font-size:11px;letter-spacing:.1em;display:block;margin-bottom:8px}
+  .modal-name{font-size:22px;font-weight:700;color:rgba(255,255,255,.95);line-height:1.3}
+  .close-btn{background:rgba(255,255,255,.06);border:none;color:rgba(255,255,255,.5);font-size:18px;width:36px;height:36px;border-radius:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .modal-domain{padding:6px 12px;border-radius:8px;background:rgba(255,255,255,.03);display:inline-block;margin-bottom:20px;font-size:11px;color:rgba(255,255,255,.4)}
+  .modal-content{font-size:14px;color:rgba(255,255,255,.7);line-height:1.8;margin-bottom:24px;padding:16px 18px;border-radius:14px;background:rgba(255,255,255,.02);border-left:2px solid rgba(255,255,255,.06);white-space:pre-wrap;word-break:break-word}
+  .mood-section{margin-bottom:20px}
+  .mood-label{font-size:11px;color:rgba(255,255,255,.3);margin-bottom:8px}
+  .mood-bar{height:6px;border-radius:3px;overflow:hidden;background:rgba(255,255,255,.04)}
+  .mood-fill{height:100%;border-radius:3px;transition:width .6s}
+  .mood-desc{font-size:11px;color:rgba(255,255,255,.3);margin-top:6px}
+  .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
+  .detail-card{padding:12px;border-radius:12px;background:rgba(255,255,255,.02);text-align:center}
+  .detail-label{font-size:10px;color:rgba(255,255,255,.3);margin-bottom:4px}
+  .detail-value{font-size:16px;font-weight:600}
+  .tags-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:20px}
+  .tag{padding:5px 10px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);font-size:11px;color:rgba(255,255,255,.45)}
+  .bucket-id{padding-top:16px;border-top:1px solid rgba(255,255,255,.04);font-size:10px;color:rgba(255,255,255,.15)}
+  .empty{text-align:center;padding:60px 20px;color:rgba(255,255,255,.2);font-size:13px}
+
+  /* Config bar */
+  .config-bar{margin-bottom:24px;padding:12px 16px;border-radius:12px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.04);display:flex;align-items:center;gap:10px;flex-wrap:wrap;animation:fadeIn .6s ease .05s both}
+  .config-input{flex:1;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#e2e8f0;font-size:12px;font-family:'IBM Plex Mono',monospace;outline:none}
+  .config-input::placeholder{color:rgba(255,255,255,.2)}
+  .config-btn{padding:8px 16px;border-radius:8px;border:none;background:rgba(6,182,212,.15);color:#06b6d4;font-size:12px;cursor:pointer;font-family:'Sora',sans-serif;transition:all .2s}
+  .config-btn:hover{background:rgba(6,182,212,.25)}
+</style>
+</head>
+<body>
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="container">
+  <div class="header">
+    <div class="header-row">
+      <div class="status-dot" id="statusDot"></div>
+      <h1 class="title">Ombre Brain</h1>
+    </div>
+    <p class="subtitle mono" id="subtitleText">Cy 的记忆系统 · 连接中...</p>
+  </div>
+
+  <!-- API URL config -->
+  <div class="config-bar">
+    <input class="config-input" id="apiUrl" type="text" placeholder="输入你的 Ombre Brain URL，例如 https://xxx.onrender.com">
+    <button class="config-btn" onclick="connectAndLoad()">连接</button>
+  </div>
+
+  <div id="mainContent" style="display:none">
+    <div class="stats" id="stats"></div>
+    <input class="search" id="search" type="text" placeholder="搜索记忆...">
+    <div class="controls"><div class="filters" id="filters"></div><div class="sorts" id="sorts"></div></div>
+    <div class="count mono" id="count"></div>
+    <div class="grid" id="grid"></div>
+  </div>
+
+  <div id="loadingArea"></div>
+</div>
+
+<div class="overlay" id="overlay"><div class="modal" id="modal" onclick="event.stopPropagation()"></div></div>
+
+<script>
+// ==================== CONFIG ====================
+let API_BASE = "";
+let ALL_BUCKETS = [];
+
+const CFG = {
+  pinned:   {label:"\ud83d\udccc \u9489\u9009", color:"#f59e0b", glow:"rgba(245,158,11,.3)", bg:"rgba(245,158,11,.08)", statusLabel:"PINNED"},
+  active:   {label:"\ud83d\udcad \u52a8\u6001", color:"#06b6d4", glow:"rgba(6,182,212,.25)", bg:"rgba(6,182,212,.06)", statusLabel:"ACTIVE"},
+  resolved: {label:"\u2705 \u5df2\u6c89\u5e95", color:"#64748b", glow:"rgba(100,116,139,.15)", bg:"rgba(100,116,139,.05)", statusLabel:"RESOLVED"},
+  feel:     {label:"\ud83e\udee7 \u611f\u53d7", color:"#c084fc", glow:"rgba(192,132,252,.3)", bg:"rgba(192,132,252,.08)", statusLabel:"FEEL"},
+};
+
+const FLIST = [{k:"all",l:"\u5168\u90e8"},{k:"pinned",l:"\ud83d\udccc \u9489\u9009"},{k:"active",l:"\ud83d\udcad \u52a8\u6001"},{k:"resolved",l:"\u2705 \u5df2\u6c89\u5e95"},{k:"feel",l:"\ud83e\udee7 \u611f\u53d7"}];
+const SLIST = [{k:"weight",l:"\u9c9c\u6d3b\u5ea6"},{k:"importance",l:"\u91cd\u8981\u5ea6"},{k:"valence",l:"\u60c5\u7eea\u8272\u5f69"}];
+
+let curF = "all", curS = "weight";
+
+// ==================== HELPERS ====================
+function getStatus(b) {
+  if (b.pinned) return "pinned";
+  if (b.resolved) return "resolved";
+  if (b.type === "feel" || (b.name && b.name.toLowerCase().includes("feel"))) return "feel";
+  return "active";
+}
+
+function vColor(v) { return v>=.8?"#4ade80":v>=.6?"#60a5fa":v>=.4?"#fbbf24":"#f87171" }
+function vLabel(v) { return v>=.8?"\u79ef\u6781\u6e29\u6696":v>=.6?"\u5e73\u9759\u4e2d\u6027":v>=.4?"\u590d\u6742\u6df7\u5408":"\u4f4e\u843d\u6c89\u91cd" }
+function aLabel(a) { return a>=.7?"\u5f3a\u70c8":a>=.4?"\u4e2d\u7b49":"\u5e73\u9759" }
+function wOpacity(w,s) { if(s==="pinned")return 1;if(s==="feel")return.9;if(s==="resolved")return.45;return w>15?1:w>10?.85:w>5?.7:.55 }
+function domainStr(d) { return Array.isArray(d)?d.join(" · "):d||"" }
+function truncate(s, n) { if(!s)return""; return s.length>n?s.slice(0,n)+"...":s }
+
+// ==================== DATA ====================
+async function connectAndLoad() {
+  let url = document.getElementById("apiUrl").value.trim();
+  if (!url) { alert("\u8bf7\u8f93\u5165 URL"); return }
+  if (url.endsWith("/")) url = url.slice(0, -1);
+  API_BASE = url;
+  localStorage.setItem("ombre_api_url", url);
+
+  showLoading();
+  try {
+    const resp = await fetch(API_BASE + "/api/pulse");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+
+    ALL_BUCKETS = (data.buckets || []).map(b => ({...b, _status: getStatus(b)}));
+
+    document.getElementById("statusDot").classList.remove("offline");
+    document.getElementById("subtitleText").textContent = "Cy \u7684\u8bb0\u5fc6\u7cfb\u7edf \u00b7 \u8870\u51cf\u5f15\u64ce\u8fd0\u884c\u4e2d";
+    document.getElementById("mainContent").style.display = "block";
+    document.getElementById("loadingArea").innerHTML = "";
+
+    renderStats();
+    renderFilters();
+    renderSorts();
+    renderGrid();
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+function showLoading() {
+  document.getElementById("mainContent").style.display = "none";
+  document.getElementById("loadingArea").innerHTML = '<div class="loading"><div class="spinner"></div><div class="loading-text mono">\u6b63\u5728\u8fde\u63a5 Ombre Brain...</div></div>';
+}
+
+function showError(msg) {
+  document.getElementById("statusDot").classList.add("offline");
+  document.getElementById("subtitleText").textContent = "Cy \u7684\u8bb0\u5fc6\u7cfb\u7edf \u00b7 \u672a\u8fde\u63a5";
+  document.getElementById("mainContent").style.display = "none";
+  document.getElementById("loadingArea").innerHTML =
+    '<div class="error-box">' +
+    '<div class="error-text">\u8fde\u63a5\u5931\u8d25</div>' +
+    '<div class="error-hint mono">' + msg + '<br><br>\u786e\u8ba4 Ombre Brain \u670d\u52a1\u6b63\u5728\u8fd0\u884c\uff0c<br>\u5e76\u4e14\u5df2\u6dfb\u52a0 /api/pulse \u7aef\u70b9\u3002</div>' +
+    '<button class="retry-btn" onclick="connectAndLoad()">\u91cd\u8bd5</button></div>';
+}
+
+// ==================== RENDER ====================
+function getFiltered() {
+  let items = [...ALL_BUCKETS];
+  if (curF !== "all") items = items.filter(b => b._status === curF);
+  const q = document.getElementById("search").value.toLowerCase().trim();
+  if (q) items = items.filter(b =>
+    (b.name||"").toLowerCase().includes(q) ||
+    domainStr(b.domain).toLowerCase().includes(q) ||
+    (b.tags||[]).some(t => t.toLowerCase().includes(q)) ||
+    (b.content||"").toLowerCase().includes(q)
+  );
+  items.sort((a,b) => curS==="weight"?b.weight-a.weight : curS==="importance"?b.importance-a.importance : b.valence-a.valence);
+  return items;
+}
+
+function renderStats() {
+  const c = {pinned:0,active:0,resolved:0,feel:0};
+  ALL_BUCKETS.forEach(b => c[b._status]++);
+  document.getElementById("stats").innerHTML = [
+    {l:"\u9489\u9009",v:c.pinned,cl:"#f59e0b"},{l:"\u52a8\u6001",v:c.active,cl:"#06b6d4"},
+    {l:"\u5df2\u6c89\u5e95",v:c.resolved,cl:"#64748b"},{l:"\u611f\u53d7",v:c.feel,cl:"#c084fc"}
+  ].map(s => '<div class="stat-card"><div class="stat-num" style="color:'+s.cl+'">'+s.v+'</div><div class="stat-label mono">'+s.l+'</div></div>').join("");
+}
+
+function renderFilters() {
+  document.getElementById("filters").innerHTML = FLIST.map(f =>
+    '<button class="filter-btn mono '+(curF===f.k?"active":"")+'" onclick="setFilter(\''+f.k+'\')">'+f.l+'</button>').join("");
+}
+function renderSorts() {
+  document.getElementById("sorts").innerHTML = SLIST.map(s =>
+    '<button class="sort-btn mono '+(curS===s.k?"active":"")+'" onclick="setSort(\''+s.k+'\')">'+s.l+'</button>').join("");
+}
+
+function impBar(val) {
+  let h = '<div class="imp-bar">';
+  for(let i=0;i<10;i++){const ht=i<val?12:6;const bg=i<val?"rgba(255,255,255,"+(.3+(i/10)*.5).toFixed(2)+")":"rgba(255,255,255,.08)";h+='<div class="imp-tick" style="width:3px;height:'+ht+'px;background:'+bg+'"></div>'}
+  return h+'</div>';
+}
+
+function renderGrid() {
+  const items = getFiltered();
+  document.getElementById("count").textContent = items.length + " \u6761\u8bb0\u5fc6";
+  if (!items.length) { document.getElementById("grid").innerHTML = '<div class="empty mono">\u6ca1\u6709\u627e\u5230\u5339\u914d\u7684\u8bb0\u5fc6</div>'; return }
+
+  document.getElementById("grid").innerHTML = items.map((b, i) => {
+    const c = CFG[b._status] || CFG.active;
+    const op = wOpacity(b.weight, b._status);
+    const dom = domainStr(b.domain);
+    const desc = truncate(b.content, 80);
+    const wt = (b._status!=="pinned"&&b._status!=="feel") ? '<span class="weight-text mono">W'+b.weight+'</span>' : "";
+
+    return '<div class="card" style="background:'+c.bg+';border:1px solid rgba(255,255,255,.06);opacity:'+op+';animation-delay:'+i*.03+'s" onclick="openModal(\''+b.id+'\')">' +
+      '<div class="card-glow" style="background:'+c.color+';box-shadow:0 0 12px '+c.glow+'"></div>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">' +
+        '<span class="card-status mono" style="color:'+c.color+'">'+c.statusLabel+'</span>' +
+        (dom ? '<span class="card-domain mono">'+dom+'</span>' : "") +
+      '</div>' +
+      '<div class="card-name">'+b.name+'</div>' +
+      (desc ? '<div class="card-desc">'+desc+'</div>' : '') +
+      '<div class="card-bottom">'+impBar(b.importance)+
+        '<div class="metrics"><span><span class="v-dot" style="background:'+vColor(b.valence)+'"></span> <span class="metric-text mono">'+vLabel(b.valence)+'</span></span>'+wt+'</div>' +
+      '</div></div>';
+  }).join("");
+}
+
+function openModal(id) {
+  const b = ALL_BUCKETS.find(x => x.id === id);
+  if (!b) return;
+  const s = b._status;
+  const c = CFG[s] || CFG.active;
+  const dom = domainStr(b.domain);
+  const wDisplay = b.pinned ? "\u221e" : b.weight;
+  const wDesc = b.pinned ? "\u6c38\u4e0d\u8870\u51cf" : b.weight>15 ? "\u975e\u5e38\u9c9c\u6d3b" : b.weight>10 ? "\u8f83\u4e3a\u9c9c\u6d3b" : b.weight>5 ? "\u6b63\u5728\u6de1\u5316" : "\u5df2\u57fa\u672c\u6c89\u5e95";
+  const tagsHtml = (b.tags||[]).length ?
+    '<div style="margin-bottom:20px"><div class="mood-label mono" style="margin-bottom:10px">\u6807\u7b7e</div><div class="tags-wrap">'+(b.tags||[]).map(t=>'<span class="tag mono">'+t+'</span>').join("")+'</div></div>' : "";
+  const dateInfo = [];
+  if (b.created) dateInfo.push("\u521b\u5efa: "+b.created);
+  if (b.last_active) dateInfo.push("\u4e0a\u6b21\u6d3b\u8dc3: "+b.last_active);
+  const dateStr = dateInfo.length ? ' · '+dateInfo.join(" · ") : "";
+
+  document.getElementById("modal").innerHTML =
+    '<div class="modal-header"><div>' +
+      '<span class="modal-status mono" style="color:'+c.color+'">'+c.label+'</span>' +
+      '<div class="modal-name">'+b.name+'</div></div>' +
+      '<button class="close-btn" onclick="closeModal()">\u2715</button></div>' +
+    (dom ? '<div class="modal-domain mono">'+dom+'</div>' : '') +
+    '<div class="modal-content">'+(b.content||"\u65e0\u5185\u5bb9")+'</div>' +
+    '<div class="mood-section">' +
+      '<div class="mood-label mono">\u60c5\u7eea\u8272\u5f69 \u00b7 '+vLabel(b.valence)+'</div>' +
+      '<div class="mood-bar"><div class="mood-fill" style="width:'+b.valence*100+'%;background:linear-gradient(90deg,#f87171,#fbbf24,#60a5fa,#4ade80)"></div></div>' +
+      '<div class="mood-desc mono">\u60c5\u7eea\u5f3a\u5ea6\uff1a'+aLabel(b.arousal)+'</div></div>' +
+    '<div class="detail-grid">' +
+      '<div class="detail-card"><div class="detail-label mono">\u8bb0\u5fc6\u9c9c\u6d3b\u5ea6</div><div class="detail-value" style="color:'+c.color+'">'+wDisplay+'</div><div class="mood-desc mono" style="margin-top:4px">'+wDesc+'</div></div>' +
+      '<div class="detail-card"><div class="detail-label mono">\u91cd\u8981\u5ea6</div><div class="detail-value" style="color:rgba(255,255,255,.8)">'+b.importance+'/10</div><div class="mood-desc mono" style="margin-top:4px">'+(b.importance>=9?"\u6838\u5fc3\u8bb0\u5fc6":b.importance>=7?"\u91cd\u8981":"\u666e\u901a")+'</div></div>' +
+    '</div>' +
+    tagsHtml +
+    '<div class="bucket-id mono">bucket_id: '+b.id+dateStr+'</div>';
+
+  document.getElementById("overlay").classList.add("open");
+}
+
+function closeModal() { document.getElementById("overlay").classList.remove("open") }
+function setFilter(k) { curF=k; renderFilters(); renderGrid() }
+function setSort(k) { curS=k; renderSorts(); renderGrid() }
+
+// ==================== INIT ====================
+document.getElementById("overlay").addEventListener("click", closeModal);
+document.getElementById("search").addEventListener("input", renderGrid);
+
+// Auto-load saved URL
+const savedUrl = localStorage.getItem("ombre_api_url");
+if (savedUrl) {
+  document.getElementById("apiUrl").value = savedUrl;
+  connectAndLoad();
+}
+</script>
+</body>
+</html>
