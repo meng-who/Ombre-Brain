@@ -482,9 +482,19 @@ class BucketManager:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=50)
                 if vector_results:
                     vector_ids = {bid for bid, _ in vector_results}
+                    pinned_candidates = [
+                        b for b in candidates
+                        if b["metadata"].get("pinned") or b["metadata"].get("type") == "permanent"
+                    ]
                     emb_candidates = [b for b in candidates if b["id"] in vector_ids]
-                    if emb_candidates:  # only replace if there's non-empty overlap
-                        candidates = emb_candidates
+                    merged_ids = set()
+                    merged = []
+                    for b in emb_candidates + pinned_candidates:
+                        if b["id"] not in merged_ids:
+                            merged_ids.add(b["id"])
+                            merged.append(b)
+                    if merged:
+                        candidates = merged
                     # else: keep original candidates as fallback
             except Exception as e:
                 logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 预筛失败: {e}")
