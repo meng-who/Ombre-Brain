@@ -534,7 +534,8 @@ class BucketManager:
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 # remain reachable by keyword (penalty applied only to ranking).
-                if normalized >= self.fuzzy_threshold:
+                pinned_bucket = meta.get("pinned", False) or meta.get("type") == "permanent"
+                if normalized >= (self.fuzzy_threshold * 0.4 if pinned_bucket else self.fuzzy_threshold):
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
                     if meta.get("resolved", False):
