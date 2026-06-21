@@ -211,6 +211,21 @@ def count_tokens_approx(text: str) -> int:
     return int(chinese_chars * 1.5 + english_words * 1.3 + len(text) * 0.05)
 
 
+def strip_wikilinks(text: str) -> str:
+    """
+    Remove Obsidian [[wikilink]] syntax, keeping the display text.
+    去除 Obsidian [[双链]] 语法，保留显示文本。
+
+    [[link]] → link
+    [[link|display]] → display
+    """
+    return re.sub(
+        r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]",
+        lambda m: m.group(2) or m.group(1),
+        text,
+    )
+
+
 def now_iso() -> str:
     """
     Return current time as ISO format string.
