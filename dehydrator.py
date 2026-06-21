@@ -13,10 +13,10 @@
 #
 # Operating modes:
 # 工作模式：
-#   - API only: OpenAI-compatible API (DeepSeek/Ollama/LM Studio/vLLM/Gemini etc.)
-#     仅 API：通过 OpenAI 兼容客户端调用 LLM API
-#   - Dehydration cache: SQLite persistent cache to avoid redundant API calls
-#     脱水缓存：SQLite 持久缓存，避免重复调用 API
+#   - Primary: OpenAI-compatible API (DeepSeek/Ollama/LM Studio/vLLM/Gemini etc.)
+#     主路径：通过 OpenAI 兼容客户端调用 LLM API
+#   - Fallback: local keyword extraction when API is unavailable
+#     备用路径：API 不可用时用本地关键词提取
 #
 # Depended on by: server.py
 # 被谁依赖：server.py
@@ -26,9 +26,9 @@
 import os
 import re
 import json
-import hashlib
-import sqlite3
 import logging
+from collections import Counter
+import jieba
 
 from openai import AsyncOpenAI
 
@@ -60,32 +60,45 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 
 # --- Diary digest prompt: split daily notes into independent memory entries ---
 # --- 日记整理提示词：把一大段日常拆分成多个独立记忆条目 ---
-DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含今天各种事情的文本（可能很杂乱），请你将其拆分成多个独立的记忆条目。
+# {name} placeholder is filled at runtime from config.user_name
+# {name} 占位符在运行时从 config.user_name 填充
+DIGEST_PROMPT = """你是一个私人日记整理助手。以下内容记录的是 {name} 的日常经历。
+请将其拆分成多个独立的记忆条目。
 
-整理规则：
-1. 每个条目应该是一个独立的主题/事件（不要混在一起）
-2. 为每个条目自动分析元数据
-3. 去除无意义的口水话和重复信息，保留核心内容
-4. 同一主题的零散信息应合并为一个条目
-5. 如果有待办事项，单独提取为一个条目
-6. 单个条目内容不少于50字，过短的零碎信息合并到最相关的条目中
-7. 总条目数控制在 2~6 个，避免过度碎片化
-8. 在 content 中对人名、地名、专有名词用 [[双链]] 标记（如 [[婷易]]、[[Obsidian]]），普通词汇不要加
+## 人称规则（最重要）
+- 记忆的主体始终是 {name}。在 content 里用"{name}"或"她"做主语
+- 严禁使用"作者""当事人""提问者""该用户"等报告体称呼
+- 谁做了什么必须写清楚，主语不能丢
+
+## 整理规则
+1. 每个条目一个独立主题/事件
+2. 保留具体细节：人名、地点、对话片段、具体事物，不要压缩成笼统概括
+3. 保留 {name} 的情绪反应原话，不要改写成客观描述
+4. 同一主题的零散信息合并为一个条目
+5. content 用自然口语写，像在跟朋友讲这件事，禁止新闻稿/文献综述语气
+6. 保留事件的因果关系和时间顺序
+
+## todo 规则
+- 只提取 {name} 自己要做的事作为 todo
+- 别人要做的事不算 {name} 的 todo
+
+## 禁止
+- 禁止把具体事实压缩成四字成语式概括
+- 禁止改变事实方向（如翻译方向、人物关系等必须与原文一致）
+- 禁止省略关键上下文
 
 输出格式（纯 JSON 数组，无其他内容）：
 [
-  {
+  {{
     "name": "条目标题（10字以内）",
-    "content": "整理后的内容",
+    "content": "整理后的内容（保留细节，自然语气，用{name}或她做主语）",
     "domain": ["主题域1"],
     "valence": 0.7,
     "arousal": 0.4,
-    "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2"],
+    "tags": ["标签1", "标签2"],
     "importance": 5
-  }
+  }}
 ]
-
-tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 5~8 个语义相关词（近义词、上位词、关联场景词），合并为一个数组。
 
 主题域可选（选最精确的 1~2 个，只选真正相关的）：
   日常: ["饮食", "穿搭", "出行", "居家", "购物"]
@@ -98,7 +111,18 @@ tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 
   内心: ["情绪", "回忆", "梦境", "自省"]
 importance: 1-10，根据内容重要程度判断
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
-arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
+arousal: 0~1（0=平静, 0.5=普通, 1=激动）
+
+## 示例
+
+原文："{name}坐大巴时遇到一个特别能聊的e人妹妹，一路聊到目的地。到了之后跟广州来的姐妹碰面，{name}是广东人，姐妹不太懂粤语的时候她帮忙翻译。两个人一起玩了两天，走的时候有点舍不得"
+
+✅ 好的 content：
+"{name}坐大巴时遇到一个特别能聊的e人妹妹，一路聊到目的地。到了之后跟广州来的姐妹碰面，{name}是广东人，姐妹不太懂粤语的时候她帮忙翻译。两个人一起玩了两天，走的时候有点舍不得"
+
+❌ 坏的 content：
+"大巴偶遇e人妹妹，与广州朋友欢聚两天，全程翻译，分别时感不舍"
+（问题：主语丢失、朋友≠姐妹、翻译方向反了、四字概括丢细节）"""
 
 
 # --- Merge prompt: instruct LLM to blend old and new memories ---
@@ -110,7 +134,6 @@ MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容�
 2. 去除重复信息
 3. 保留所有重要事实
 4. 总长度尽量不超过旧记忆的 120%
-5. 对出现的人名、地名、专有名词用 [[双链]] 标记（如 [[婷易]]、[[Obsidian]]），普通词汇不要加
 
 直接输出合并后的文本，不要加额外说明。"""
 
@@ -131,19 +154,15 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    内心: ["情绪", "回忆", "梦境", "自省"]
 2. valence（情感效价）：0.0~1.0，0=极度消极 → 0.5=中性 → 1.0=极度积极
 3. arousal（情感唤醒度）：0.0~1.0，0=非常平静 → 0.5=普通 → 1.0=非常激动
-4. tags（关键词标签）：分两步生成，合并为一个数组：
-   第一步—精准提取：从原文抽取 3~5 个真正的核心词，不泛化、不遗漏
-   第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、用户可能用不同措辞搜索的词
-   两步合并为一个 tags 数组，总计 10~15 个
+4. tags（关键词标签）：3~5 个最能概括内容的关键词
 5. suggested_name（建议桶名）：10字以内的简短标题
-6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
 
 输出格式（纯 JSON，无其他内容）：
 {
   "domain": ["主题域1", "主题域2"],
   "valence": 0.7,
   "arousal": 0.4,
-  "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
+  "tags": ["标签1", "标签2", "标签3"],
   "suggested_name": "简短标题"
 }"""
 
@@ -152,13 +171,10 @@ class Dehydrator:
     """
     Data dehydrator + content analyzer.
     Three capabilities: dehydration / merge / auto-tagging (domain + emotion).
-    API-only: every public method requires a working LLM API.
-    If the API is unavailable, methods raise RuntimeError so callers can
-    surface the failure to the user instead of silently producing low-quality results.
+    Prefers API (better quality); auto-degrades to local (guaranteed availability).
     数据脱水器 + 内容分析器。
     三大能力：脱水压缩 / 新旧合并 / 自动打标。
-    仅走 API：API 不可用时直接抛出 RuntimeError，调用方明确感知。
-    （根据 BEHAVIOR_SPEC.md 三、降级行为表决策：无本地降级）
+    优先走 API，API 挂了自动降级到本地。
     """
 
     def __init__(self, config: dict):
@@ -170,11 +186,19 @@ class Dehydrator:
         self.max_tokens = dehy_cfg.get("max_tokens", 1024)
         self.temperature = dehy_cfg.get("temperature", 0.1)
 
+        # --- Memory subject name / 记忆主体名称 ---
+        # Used in digest prompt to enforce correct pronouns
+        # 用于脱水 prompt 中强制正确人称
+        # Supports both config.yaml and env var OMBRE_USER_NAME
+        self.user_name = config.get("user_name", "") or os.environ.get("OMBRE_USER_NAME", "")
+
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
 
         # --- Initialize OpenAI-compatible client ---
         # --- 初始化 OpenAI 兼容客户端 ---
+        # Supports any OpenAI-format API: DeepSeek / Ollama / LM Studio / vLLM / Gemini etc.
+        # User only needs to set base_url in config.yaml
         if self.api_available:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
@@ -184,71 +208,18 @@ class Dehydrator:
         else:
             self.client = None
 
-        # --- SQLite dehydration cache ---
-        # --- SQLite 脱水缓存：content hash → summary ---
-        db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
-        self.cache_db_path = db_path
-        self._init_cache_db()
-
-    def _init_cache_db(self):
-        """Create dehydration cache table if not exists."""
-        os.makedirs(os.path.dirname(self.cache_db_path), exist_ok=True)
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dehydration_cache (
-                content_hash TEXT PRIMARY KEY,
-                summary TEXT NOT NULL,
-                model TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-    def _get_cached_summary(self, content: str) -> str | None:
-        """Look up cached dehydration result by content hash."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        row = conn.execute(
-            "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
-            (content_hash,)
-        ).fetchone()
-        conn.close()
-        return row[0] if row else None
-
-    def _set_cached_summary(self, content: str, summary: str):
-        """Store dehydration result in cache."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute(
-            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
-        )
-        conn.commit()
-        conn.close()
-
-    def invalidate_cache(self, content: str):
-        """Remove cached summary for specific content (call when bucket content changes)."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
-        conn.commit()
-        conn.close()
-
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
     # 脱水：将原始内容压缩为精简摘要
-    # API only (no local fallback)
-    # 仅通过 API 脱水（无本地回退）
+    # Try API first, fallback to local
+    # 先尝试 API，失败则回退本地
     # ---------------------------------------------------------
     async def dehydrate(self, content: str, metadata: dict = None) -> str:
         """
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
-        Uses SQLite cache to avoid redundant API calls.
         对记忆内容做脱水压缩。
         返回格式化的摘要字符串，可直接注入 Claude 上下文。
-        使用 SQLite 缓存避免重复调用 API。
         """
         if not content or not content.strip():
             return "（空记忆 / empty memory）"
@@ -258,20 +229,22 @@ class Dehydrator:
         if count_tokens_approx(content) < 100:
             return self._format_output(content, metadata)
 
-        # --- Check cache first ---
-        # --- 先查缓存 ---
-        cached = self._get_cached_summary(content)
-        if cached:
-            return self._format_output(cached, metadata)
+        # --- Try API compression first (best quality) ---
+        # --- 优先尝试 API 压缩 ---
+        if self.api_available:
+            try:
+                result = await self._api_dehydrate(content)
+                if result:
+                    return self._format_output(result, metadata)
+            except Exception as e:
+                logger.warning(
+                    f"API dehydration failed, degrading to local / "
+                    f"API 脱水失败，降级到本地压缩: {e}"
+                )
 
-        # --- API dehydration (no local fallback) ---
-        # --- API 脱水（无本地降级）---
-        if not self.api_available:
-            raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
-
-        result = await self._api_dehydrate(content)
-        # --- Cache the result ---
-        self._set_cached_summary(content, result)
+        # --- Local compression fallback (works without API) ---
+        # --- 本地压缩兜底 ---
+        result = self._local_dehydrate(content)
         return self._format_output(result, metadata)
 
     # ---------------------------------------------------------
@@ -290,18 +263,20 @@ class Dehydrator:
         if not new_content:
             return old_content
 
-        # --- API merge (no local fallback) ---
-        if not self.api_available:
-            raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
-        try:
-            result = await self._api_merge(old_content, new_content)
-            if result:
-                return result
-            raise RuntimeError("API 合并返回空结果")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"API 合并失败，请检查 API 连接: {e}") from e
+        # --- Try API merge first / 优先 API 合并 ---
+        if self.api_available:
+            try:
+                result = await self._api_merge(old_content, new_content)
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(
+                    f"API merge failed, degrading to local / "
+                    f"API 合并失败，降级到本地合并: {e}"
+                )
+
+        # --- Local merge fallback / 本地合并兜底 ---
+        return self._local_merge(old_content, new_content)
 
     # ---------------------------------------------------------
     # API call: dehydration
@@ -348,7 +323,97 @@ class Dehydrator:
             return ""
         return response.choices[0].message.content or ""
 
+    # ---------------------------------------------------------
+    # Local dehydration (fallback when API is unavailable)
+    # 本地脱水（无 API 时的兜底方案）
+    # Keyword frequency + sentence position weighting
+    # 基于关键词频率 + 句子位置权重
+    # ---------------------------------------------------------
+    def _local_dehydrate(self, content: str) -> str:
+        """
+        Local keyword extraction + position-weighted simple compression.
+        本地关键词提取 + 位置加权的简单压缩。
+        """
+        # --- Split into sentences / 分句 ---
+        sentences = re.split(r"[。！？\n.!?]+", content)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
 
+        if not sentences:
+            return content[:200]
+
+        # --- Extract high-frequency keywords / 提取高频关键词 ---
+        keywords = self._extract_keywords(content)
+
+        # --- Score sentences: position weight + keyword hits ---
+        # --- 句子评分：开头结尾权重高 + 关键词命中加分 ---
+        scored = []
+        for i, sent in enumerate(sentences):
+            position_weight = 1.5 if i < 3 else (1.2 if i > len(sentences) - 3 else 1.0)
+            keyword_hits = sum(1 for kw in keywords if kw in sent)
+            score = position_weight * (1 + keyword_hits)
+            scored.append((score, sent))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # --- Top-8 sentences + keyword list / 取高分句 + 关键词列表 ---
+        selected = [s for _, s in scored[:8]]
+        summary = "。".join(selected)
+        keyword_str = ", ".join(keywords[:10])
+
+        return f"[摘要] {summary}\n[关键词] {keyword_str}"
+
+    # ---------------------------------------------------------
+    # Local merge (simple concatenation + truncation)
+    # 本地合并（简单拼接 + 截断）
+    # ---------------------------------------------------------
+    def _local_merge(self, old_content: str, new_content: str) -> str:
+        """
+        Simple concatenation merge; truncates if too long.
+        简单拼接合并，超长时截断保留两端。
+        """
+        merged = f"{old_content.strip()}\n\n--- 更新 ---\n{new_content.strip()}"
+        # Truncate if over 3000 chars / 超过 3000 字符则各取一半
+        if len(merged) > 3000:
+            half = 1400
+            merged = (
+                f"{old_content[:half].strip()}\n\n--- 更新 ---\n{new_content[:half].strip()}"
+            )
+        return merged
+
+    # ---------------------------------------------------------
+    # Keyword extraction
+    # 关键词提取
+    # Chinese + English tokenization → stopword filter → frequency sort
+    # 中英文分词 + 停用词过滤 + 词频排序
+    # ---------------------------------------------------------
+    def _extract_keywords(self, text: str) -> list[str]:
+        """
+        Extract high-frequency keywords using jieba (Chinese + English mixed).
+        用 jieba 分词提取高频关键词。
+        """
+        try:
+            words = jieba.lcut(text)
+        except Exception:
+            words = []
+        # English words / 英文单词
+        english_words = re.findall(r"[a-zA-Z]{3,}", text.lower())
+        words += english_words
+
+        # Stopwords / 停用词
+        stopwords = {
+            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
+            "都", "一个", "上", "也", "很", "到", "说", "要", "去",
+            "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "她",
+            "the", "and", "for", "are", "but", "not", "you", "all", "can",
+            "had", "her", "was", "one", "our", "out", "has", "have", "with",
+            "this", "that", "from", "they", "been", "said", "will", "each",
+        }
+        filtered = [
+            w for w in words
+            if w not in stopwords and len(w.strip()) > 1 and not re.match(r"^[0-9]+$", w)
+        ]
+        counter = Counter(filtered)
+        return [word for word, _ in counter.most_common(15)]
 
     # ---------------------------------------------------------
     # Output formatting
@@ -364,6 +429,7 @@ class Dehydrator:
         header = ""
         if metadata and isinstance(metadata, dict):
             name = metadata.get("name", "未命名")
+            tags = ", ".join(metadata.get("tags", []))
             domains = ", ".join(metadata.get("domain", []))
             try:
                 valence = float(metadata.get("valence", 0.5))
@@ -373,19 +439,10 @@ class Dehydrator:
             header = f"📌 记忆桶: {name}"
             if domains:
                 header += f" [主题:{domains}]"
+            if tags:
+                header += f" [标签:{tags}]"
             header += f" [情感:V{valence:.1f}/A{arousal:.1f}]"
-            # Show model's perspective if available (valence drift)
-            model_v = metadata.get("model_valence")
-            if model_v is not None:
-                try:
-                    header += f" [我的视角:V{float(model_v):.1f}]"
-                except (ValueError, TypeError):
-                    pass
-            if metadata.get("digested"):
-                header += " [已消化]"
             header += "\n"
-        
-        content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
         return f"{header}{content}"
 
     # ---------------------------------------------------------
@@ -404,18 +461,20 @@ class Dehydrator:
         if not content or not content.strip():
             return self._default_analysis()
 
-        # --- API analyze (no local fallback) ---
-        if not self.api_available:
-            raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
-        try:
-            result = await self._api_analyze(content)
-            if result:
-                return result
-            raise RuntimeError("API 打标返回空结果")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"API 打标失败，请检查 API 连接: {e}") from e
+        # --- Try API first (best quality) / 优先走 API ---
+        if self.api_available:
+            try:
+                result = await self._api_analyze(content)
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(
+                    f"API tagging failed, degrading to local / "
+                    f"API 打标失败，降级到本地分析: {e}"
+                )
+
+        # --- Local analysis fallback / 本地分析兜底 ---
+        return self._local_analyze(content)
 
     # ---------------------------------------------------------
     # API call: auto-tagging
@@ -477,8 +536,119 @@ class Dehydrator:
             "domain": result.get("domain", ["未分类"])[:3],
             "valence": valence,
             "arousal": arousal,
-            "tags": result.get("tags", [])[:15],
+            "tags": result.get("tags", [])[:5],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
+        }
+
+    # ---------------------------------------------------------
+    # Local analysis (fallback when API is unavailable)
+    # 本地分析（无 API 时的兜底方案）
+    # Keyword matching + simple sentiment dictionary
+    # 基于关键词 + 简单情感词典匹配
+    # ---------------------------------------------------------
+    def _local_analyze(self, content: str) -> dict:
+        """
+        Local keyword + sentiment dictionary analysis.
+        本地关键词 + 情感词典的简单分析。
+        """
+        keywords = self._extract_keywords(content)
+        text_lower = content.lower()
+
+        # --- Domain matching by keyword hits ---
+        # --- 主题域匹配：基于关键词命中 ---
+        domain_keywords = {
+            # Daily / 日常
+            "饮食": {"吃", "饭", "做饭", "外卖", "奶茶", "咖啡", "麻辣烫", "面包",
+                    "超市", "零食", "水果", "牛奶", "食堂", "减肥", "节食"},
+            "出行": {"旅行", "出发", "航班", "酒店", "地铁", "打车", "高铁", "机票",
+                    "景点", "签证", "护照"},
+            "居家": {"打扫", "洗衣", "搬家", "快递", "收纳", "装修", "租房"},
+            "购物": {"买", "下单", "到货", "退货", "优惠", "折扣", "代购"},
+            # Relationships / 人际
+            "家庭": {"爸", "妈", "父亲", "母亲", "家人", "弟弟", "姐姐", "哥哥",
+                    "奶奶", "爷爷", "亲戚", "家里"},
+            "恋爱": {"爱人", "男友", "女友", "恋", "约会", "接吻", "分手",
+                    "暧昧", "在一起", "想你", "同床"},
+            "友谊": {"朋友", "闺蜜", "兄弟", "聚", "约饭", "聊天", "群"},
+            "社交": {"见面", "被人", "圈子", "消息", "评论", "点赞"},
+            # Growth / 成长
+            "工作": {"会议", "项目", "客户", "汇报", "deadline", "同事",
+                    "老板", "薪资", "合同", "需求", "加班", "实习"},
+            "学习": {"课", "考试", "论文", "笔记", "作业", "教授", "讲座",
+                    "分数", "选课", "学分"},
+            "求职": {"面试", "简历", "offer", "投递", "薪资", "岗位"},
+            # Health / 身心
+            "健康": {"医院", "复查", "吃药", "抽血", "手术", "心率",
+                    "病", "症状", "指标", "体检", "月经"},
+            "心理": {"焦虑", "抑郁", "恐慌", "创伤", "人格", "咨询",
+                    "安全感", "自残", "崩溃", "压力"},
+            "睡眠": {"睡", "失眠", "噩梦", "清醒", "熬夜", "早起", "午觉"},
+            # Interests / 兴趣
+            "游戏": {"游戏", "steam", "极乐迪斯科", "存档", "通关", "角色",
+                    "mod", "DLC", "剧情"},
+            "影视": {"电影", "番剧", "动漫", "剧", "综艺", "追番", "上映"},
+            "音乐": {"歌", "音乐", "专辑", "live", "演唱会", "耳机"},
+            "阅读": {"书", "小说", "读完", "kindle", "连载", "漫画"},
+            "创作": {"写", "画", "预设", "脚本", "视频", "剪辑", "P图",
+                    "SillyTavern", "插件", "正则", "人设"},
+            # Digital / 数字
+            "编程": {"代码", "code", "python", "bug", "api", "docker",
+                    "git", "调试", "框架", "部署", "开发", "server"},
+            "AI": {"模型", "GPT", "Claude", "gemini", "LLM", "token",
+                   "prompt", "LoRA", "微调", "推理", "MCP"},
+            "网络": {"VPN", "梯子", "代理", "域名", "隧道", "服务器",
+                    "cloudflare", "tunnel", "反代"},
+            # Affairs / 事务
+            "财务": {"钱", "转账", "工资", "花了", "欠", "还款", "借",
+                    "账单", "余额", "预算", "黄金"},
+            "计划": {"计划", "目标", "deadline", "日程", "清单", "安排"},
+            "待办": {"要做", "记得", "别忘", "提醒", "下次"},
+            # Inner / 内心
+            "情绪": {"开心", "难过", "生气", "哭", "泪", "孤独", "幸福",
+                    "伤心", "烦", "委屈", "感动", "温柔"},
+            "回忆": {"以前", "小时候", "那时", "怀念", "曾经", "记得"},
+            "梦境": {"梦", "梦到", "梦见", "噩梦", "清醒梦"},
+            "自省": {"反思", "觉得自己", "问自己", "意识到", "明白了"},
+        }
+
+        matched_domains = []
+        for domain, kws in domain_keywords.items():
+            hits = sum(1 for kw in kws if kw in text_lower)
+            if hits >= 2:
+                matched_domains.append((domain, hits))
+        matched_domains.sort(key=lambda x: x[1], reverse=True)
+        domains = [d for d, _ in matched_domains[:3]] or ["未分类"]
+
+        # --- Emotion estimation via simple sentiment dictionary ---
+        # --- 情感坐标估算：基于简单情感词典 ---
+        positive_words = {"开心", "高兴", "喜欢", "哈哈", "棒", "赞", "爱",
+                          "幸福", "成功", "感动", "兴奋", "棒极了",
+                          "happy", "love", "great", "awesome", "nice"}
+        negative_words = {"难过", "伤心", "生气", "焦虑", "害怕", "无聊",
+                          "烦", "累", "失望", "崩溃", "愤怒", "痛苦",
+                          "sad", "angry", "hate", "tired", "afraid"}
+        intense_words = {"太", "非常", "极", "超", "特别", "十分", "炸",
+                         "崩溃", "激动", "愤怒", "狂喜", "very", "so", "extremely"}
+
+        pos_count = sum(1 for w in positive_words if w in text_lower)
+        neg_count = sum(1 for w in negative_words if w in text_lower)
+        intense_count = sum(1 for w in intense_words if w in text_lower)
+
+        # valence: positive/negative emotion balance
+        if pos_count + neg_count > 0:
+            valence = 0.5 + 0.4 * (pos_count - neg_count) / (pos_count + neg_count)
+        else:
+            valence = 0.5
+
+        # arousal: intensity level
+        arousal = min(1.0, 0.3 + intense_count * 0.15 + (pos_count + neg_count) * 0.08)
+
+        return {
+            "domain": domains,
+            "valence": round(max(0.0, min(1.0, valence)), 2),
+            "arousal": round(max(0.0, min(1.0, arousal)), 2),
+            "tags": keywords[:5],
+            "suggested_name": "",
         }
 
     # ---------------------------------------------------------
@@ -514,18 +684,21 @@ class Dehydrator:
         if not content or not content.strip():
             return []
 
-        # --- API digest (no local fallback) ---
-        if not self.api_available:
-            raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
-        try:
-            result = await self._api_digest(content)
-            if result:
-                return result
-            raise RuntimeError("API 日记整理返回空结果")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"API 日记整理失败，请检查 API 连接: {e}") from e
+        # --- Try API digest first (best quality, understands semantic splits) ---
+        # --- 优先 API 整理 ---
+        if self.api_available:
+            try:
+                result = await self._api_digest(content)
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(
+                    f"API diary digest failed, degrading to local / "
+                    f"API 日记整理失败，降级到本地拆分: {e}"
+                )
+
+        # --- Local split fallback / 本地拆分兜底 ---
+        return await self._local_digest(content)
 
     # ---------------------------------------------------------
     # API call: diary digest
@@ -536,14 +709,17 @@ class Dehydrator:
         Call LLM API for diary organization.
         调用 LLM API 执行日记整理。
         """
+        # Format prompt with user_name from config
+        # 用 config 里的 user_name 填充 prompt 模板
+        prompt = DIGEST_PROMPT.format(name=self.user_name or "用户")
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": DIGEST_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": content[:5000]},
             ],
             max_tokens=2048,
-            temperature=0.0,
+            temperature=0.2,
         )
         if not response.choices:
             return []
@@ -589,11 +765,71 @@ class Dehydrator:
 
             validated.append({
                 "name": str(item.get("name", ""))[:20],
-                "content": str(item.get("content", "")),
+                "content": self._clean_pronouns(str(item.get("content", ""))),
                 "domain": item.get("domain", ["未分类"])[:3],
                 "valence": valence,
                 "arousal": arousal,
-                "tags": item.get("tags", [])[:15],
+                "tags": item.get("tags", [])[:5],
                 "importance": importance,
             })
         return validated
+
+    # ---------------------------------------------------------
+    # Pronoun safety net: replace report-style references
+    # 人称安全网：替换报告体称呼
+    # ---------------------------------------------------------
+    def _clean_pronouns(self, text: str) -> str:
+        """
+        Replace report-style references with user_name.
+        Last-resort fix if the LLM ignores prompt instructions.
+        如果脱水模型无视 prompt 指令，最后一道防线。
+        """
+        if not self.user_name:
+            return text
+        bad_refs = ["作者", "当事人", "提问者", "该用户", "本人"]
+        for ref in bad_refs:
+            text = text.replace(ref, self.user_name)
+        return text
+
+    # ---------------------------------------------------------
+    # Local diary split (fallback when API is unavailable)
+    # 本地日记拆分（无 API 时的兜底）
+    # Split by blank lines/separators, analyze each segment
+    # 按空行/分隔符拆段，每段独立分析
+    # ---------------------------------------------------------
+    async def _local_digest(self, content: str) -> list[dict]:
+        """
+        Local paragraph split + per-segment analysis.
+        本地按段落拆分 + 逐段分析。
+        """
+        # Split by blank lines or separators / 按空行或分隔线拆分
+        segments = re.split(r"\n{2,}|---+|\n-\s", content)
+        segments = [s.strip() for s in segments if len(s.strip()) > 20]
+
+        if not segments:
+            # Content too short, treat as single entry
+            # 内容太短，整个作为一个条目
+            analysis = self._local_analyze(content)
+            return [{
+                "name": analysis.get("suggested_name", "日记"),
+                "content": content.strip(),
+                "domain": analysis["domain"],
+                "valence": analysis["valence"],
+                "arousal": analysis["arousal"],
+                "tags": analysis["tags"],
+                "importance": 5,
+            }]
+
+        items = []
+        for seg in segments[:10]:  # Max 10 segments / 最多 10 段
+            analysis = self._local_analyze(seg)
+            items.append({
+                "name": analysis.get("suggested_name", "") or seg[:10],
+                "content": seg,
+                "domain": analysis["domain"],
+                "valence": analysis["valence"],
+                "arousal": analysis["arousal"],
+                "tags": analysis["tags"],
+                "importance": 5,
+            })
+        return items
