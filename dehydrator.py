@@ -86,6 +86,7 @@ DIGEST_PROMPT = """你是一个私人日记整理助手。以下内容记录的�
 - 禁止把具体事实压缩成四字成语式概括
 - 禁止改变事实方向（如翻译方向、人物关系等必须与原文一致）
 - 禁止省略关键上下文
+- 禁止用"该女士""该男士""该同事""此人"等指示代词称呼任何人，用原文里的称呼（名字、姐妹、朋友等）或自然口语的说法
 
 输出格式（纯 JSON 数组，无其他内容）：
 [
@@ -782,11 +783,15 @@ class Dehydrator:
         """
         Replace report-style references with user_name.
         Last-resort fix if the LLM ignores prompt instructions.
+        Only replaces terms that unambiguously refer to the memory subject.
         如果脱水模型无视 prompt 指令，最后一道防线。
+        只替换明确指代记忆主体的报告体称呼，不动可能指其他人的词。
         """
         if not self.user_name:
             return text
-        bad_refs = ["作者", "当事人", "提问者", "该用户", "本人"]
+        # Only terms that always mean the diary author / memory subject
+        # "该女士""该男士" etc. might refer to other people in the story
+        bad_refs = ["作者", "当事人", "提问者", "该用户"]
         for ref in bad_refs:
             text = text.replace(ref, self.user_name)
         return text
