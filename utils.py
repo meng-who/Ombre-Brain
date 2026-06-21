@@ -98,14 +98,33 @@ def load_config(config_path: str = None) -> dict:
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
 
-    # --- user_name: memory subject name (used in dehydration prompts) ---
-    # --- user_name: 记忆主体名称（用于脱水 prompt 的人称控制）---
+    # OMBRE_DEHYDRATION_MODEL (with OMBRE_MODEL alias) overrides dehydration.model
+    env_dehy_model = os.environ.get("OMBRE_DEHYDRATION_MODEL", "") or os.environ.get("OMBRE_MODEL", "")
+    if env_dehy_model:
+        config.setdefault("dehydration", {})["model"] = env_dehy_model
+
+    # OMBRE_DEHYDRATION_BASE_URL overrides dehydration.base_url
+    env_dehy_base_url = os.environ.get("OMBRE_DEHYDRATION_BASE_URL", "")
+    if env_dehy_base_url:
+        config.setdefault("dehydration", {})["base_url"] = env_dehy_base_url
+
+    # OMBRE_EMBEDDING_MODEL overrides embedding.model
+    env_embed_model = os.environ.get("OMBRE_EMBEDDING_MODEL", "")
+    if env_embed_model:
+        config.setdefault("embedding", {})["model"] = env_embed_model
+
+    # OMBRE_EMBEDDING_BASE_URL overrides embedding.base_url
+    env_embed_base_url = os.environ.get("OMBRE_EMBEDDING_BASE_URL", "")
+    if env_embed_base_url:
+        config.setdefault("embedding", {})["base_url"] = env_embed_base_url
+
+    # OMBRE_USER_NAME: memory subject name (used in dehydration prompts)
+    # 记忆主体名称（用于脱水 prompt 的人称控制）
     env_user_name = os.environ.get("OMBRE_USER_NAME", "")
     if env_user_name:
         config["user_name"] = env_user_name
 
-    # --- merge_threshold override ---
-    # --- 合并阈值覆盖 ---
+    # OMBRE_MERGE_THRESHOLD overrides merge_threshold
     env_merge_threshold = os.environ.get("OMBRE_MERGE_THRESHOLD", "")
     if env_merge_threshold:
         try:
@@ -165,6 +184,14 @@ def generate_bucket_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def strip_wikilinks(text: str) -> str:
+    """
+    Remove Obsidian wikilink brackets: [[word]] → word
+    去除 Obsidian 双链括号
+    """
+    return re.sub(r"\[\[([^\]]+)\]\]", r"\1", text) if text else text
+
+
 def sanitize_name(name: str) -> str:
     """
     Sanitize bucket name, keeping only safe characters.
@@ -209,21 +236,6 @@ def count_tokens_approx(text: str) -> int:
     chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
     english_words = len(re.findall(r"[a-zA-Z]+", text))
     return int(chinese_chars * 1.5 + english_words * 1.3 + len(text) * 0.05)
-
-
-def strip_wikilinks(text: str) -> str:
-    """
-    Remove Obsidian [[wikilink]] syntax, keeping the display text.
-    去除 Obsidian [[双链]] 语法，保留显示文本。
-
-    [[link]] → link
-    [[link|display]] → display
-    """
-    return re.sub(
-        r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]",
-        lambda m: m.group(2) or m.group(1),
-        text,
-    )
 
 
 def now_iso() -> str:
