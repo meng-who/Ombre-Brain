@@ -32,7 +32,7 @@ def load_config(config_path: str = None) -> dict:
         "transport": "stdio",
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
-        "merge_threshold": 75,
+        "merge_threshold": 65,
         "dehydration": {
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",
@@ -98,25 +98,20 @@ def load_config(config_path: str = None) -> dict:
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
 
-    # OMBRE_DEHYDRATION_MODEL (with OMBRE_MODEL alias) overrides dehydration.model
-    env_dehy_model = os.environ.get("OMBRE_DEHYDRATION_MODEL", "") or os.environ.get("OMBRE_MODEL", "")
-    if env_dehy_model:
-        config.setdefault("dehydration", {})["model"] = env_dehy_model
+    # --- user_name: memory subject name (used in dehydration prompts) ---
+    # --- user_name: 记忆主体名称（用于脱水 prompt 的人称控制）---
+    env_user_name = os.environ.get("OMBRE_USER_NAME", "")
+    if env_user_name:
+        config["user_name"] = env_user_name
 
-    # OMBRE_DEHYDRATION_BASE_URL overrides dehydration.base_url
-    env_dehy_base_url = os.environ.get("OMBRE_DEHYDRATION_BASE_URL", "")
-    if env_dehy_base_url:
-        config.setdefault("dehydration", {})["base_url"] = env_dehy_base_url
-
-    # OMBRE_EMBEDDING_MODEL overrides embedding.model
-    env_embed_model = os.environ.get("OMBRE_EMBEDDING_MODEL", "")
-    if env_embed_model:
-        config.setdefault("embedding", {})["model"] = env_embed_model
-
-    # OMBRE_EMBEDDING_BASE_URL overrides embedding.base_url
-    env_embed_base_url = os.environ.get("OMBRE_EMBEDDING_BASE_URL", "")
-    if env_embed_base_url:
-        config.setdefault("embedding", {})["base_url"] = env_embed_base_url
+    # --- merge_threshold override ---
+    # --- 合并阈值覆盖 ---
+    env_merge_threshold = os.environ.get("OMBRE_MERGE_THRESHOLD", "")
+    if env_merge_threshold:
+        try:
+            config["merge_threshold"] = int(env_merge_threshold)
+        except ValueError:
+            pass
 
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
@@ -168,14 +163,6 @@ def generate_bucket_id() -> str:
     生成唯一的记忆桶 ID（12 位短 UUID，方便人类阅读）。
     """
     return uuid.uuid4().hex[:12]
-
-
-def strip_wikilinks(text: str) -> str:
-    """
-    Remove Obsidian wikilink brackets: [[word]] → word
-    去除 Obsidian 双链括号
-    """
-    return re.sub(r"\[\[([^\]]+)\]\]", r"\1", text) if text else text
 
 
 def sanitize_name(name: str) -> str:
