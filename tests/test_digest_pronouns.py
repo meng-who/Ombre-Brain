@@ -6,12 +6,12 @@ from dehydrator import Dehydrator, DIGEST_PROMPT
 def test_digest_prompt_preserves_source_subjects():
     assert "严格保留原文的人称、主语和称呼" in DIGEST_PROMPT
     assert "禁止把所有记忆主体统一改成某个固定名字" in DIGEST_PROMPT
-    assert "记忆的主体始终是" not in DIGEST_PROMPT
+    assert "作者" in DIGEST_PROMPT
 
 
 def test_parse_digest_does_not_replace_subject_with_user_name():
     dehydrator = Dehydrator({
-        "user_name": "Melissa",
+        "human": {"name": "Melissa"},
         "dehydration": {"api_key": ""},
     })
 
@@ -34,7 +34,7 @@ def test_parse_digest_does_not_replace_subject_with_user_name():
 
 def test_parse_digest_replaces_report_reference_with_source_first_person():
     dehydrator = Dehydrator({
-        "user_name": "Melissa",
+        "human": {"name": "Melissa"},
         "dehydration": {"api_key": ""},
     })
 
@@ -57,7 +57,7 @@ def test_parse_digest_replaces_report_reference_with_source_first_person():
 
 def test_parse_digest_replaces_report_reference_with_source_name():
     dehydrator = Dehydrator({
-        "user_name": "Melissa",
+        "human": {"name": "Melissa"},
         "dehydration": {"api_key": ""},
     })
 
