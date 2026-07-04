@@ -60,27 +60,29 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 
 # --- Diary digest prompt: split daily notes into independent memory entries ---
 # --- 日记整理提示词：把一大段日常拆分成多个独立记忆条目 ---
-# {name} placeholder is filled at runtime from config.user_name
-# {name} 占位符在运行时从 config.user_name 填充
-DIGEST_PROMPT = """你是一个私人日记整理助手。以下内容记录的是 {name} 的日常经历。
+# Keep the subject exactly as written in the source text.
+# 保留原文中的主语和称呼，不用配置名统一改写。
+DIGEST_PROMPT = """你是一个私人日记整理助手。以下内容是一段日常记录。
 请将其拆分成多个独立的记忆条目。
 
 ## 人称规则（最重要）
-- 记忆的主体始终是 {name}。在 content 里用"{name}"或"她"做主语
+- 严格保留原文的人称、主语和称呼：原文写“我”就保留“我”，原文写具体名字就保留具体名字，原文写“她/他/朋友/姐妹/妈妈”等就按原文关系保留
+- 禁止把所有记忆主体统一改成某个固定名字；不要因为配置名、示例名或上下文名而替换原文主语
+- 如果同一段里有多个人，必须写清楚谁做了什么，不能把别人的行动归到主角身上
 - 严禁使用"作者""当事人""提问者""该用户"等报告体称呼
 - 谁做了什么必须写清楚，主语不能丢
 
 ## 整理规则
 1. 每个条目一个独立主题/事件
 2. 保留具体细节：人名、地点、对话片段、具体事物，不要压缩成笼统概括
-3. 保留 {name} 的情绪反应原话，不要改写成客观描述
+3. 保留原文中的情绪反应原话，不要改写成客观描述
 4. 同一主题的零散信息合并为一个条目
 5. content 用自然口语写，像在跟朋友讲这件事，禁止新闻稿/文献综述语气
 6. 保留事件的因果关系和时间顺序
 
 ## todo 规则
-- 只提取 {name} 自己要做的事作为 todo
-- 别人要做的事不算 {name} 的 todo
+- 只提取原文主语自己要做的事作为 todo
+- 别人要做的事不算原文主语的 todo
 
 ## 禁止
 - 禁止把具体事实压缩成四字成语式概括
@@ -92,7 +94,7 @@ DIGEST_PROMPT = """你是一个私人日记整理助手。以下内容记录的�
 [
   {{
     "name": "条目标题（10字以内）",
-    "content": "整理后的内容（保留细节，自然语气，用{name}或她做主语）",
+    "content": "整理后的内容（保留细节，自然语气，主语和称呼必须按原文保留）",
     "domain": ["主题域1"],
     "valence": 0.7,
     "arousal": 0.4,
@@ -116,10 +118,14 @@ arousal: 0~1（0=平静, 0.5=普通, 1=激动）
 
 ## 示例
 
-原文："{name}坐大巴时遇到一个特别能聊的e人妹妹，一路聊到目的地。到了之后跟广州来的姐妹碰面，{name}是广东人，姐妹不太懂粤语的时候她帮忙翻译。两个人一起玩了两天，走的时候有点舍不得"
+原文："我坐大巴时遇到一个特别能聊的e人妹妹，一路聊到目的地。到了之后跟广州来的姐妹碰面，我是广东人，姐妹不太懂粤语的时候我帮忙翻译。两个人一起玩了两天，走的时候有点舍不得"
 
 ✅ 好的 content：
-"{name}坐大巴时遇到一个特别能聊的e人妹妹，一路聊到目的地。到了之后跟广州来的姐妹碰面，{name}是广东人，姐妹不太懂粤语的时候她帮忙翻译。两个人一起玩了两天，走的时候有点舍不得"
+"我坐大巴时遇到一个特别能聊的e人妹妹，一路聊到目的地。到了之后跟广州来的姐妹碰面，我是广东人，姐妹不太懂粤语的时候我帮忙翻译。两个人一起玩了两天，走的时候有点舍不得"
+
+❌ 坏的 content：
+"Melissa坐大巴时遇到一个特别能聊的e人妹妹，到了之后跟广州朋友碰面，Melissa帮忙翻译，两个人一起玩了两天。"
+（问题：把原文“我”强行改成固定名字、朋友≠姐妹）
 
 ❌ 坏的 content：
 "大巴偶遇e人妹妹，与广州朋友欢聚两天，全程翻译，分别时感不舍"
@@ -187,9 +193,10 @@ class Dehydrator:
         self.max_tokens = dehy_cfg.get("max_tokens", 1024)
         self.temperature = dehy_cfg.get("temperature", 0.1)
 
-        # --- Memory subject name / 记忆主体名称 ---
-        # Used in digest prompt to enforce correct pronouns
-        # 用于脱水 prompt 中强制正确人称
+        # --- Legacy memory subject name / 旧版记忆主体名称 ---
+        # Kept for backward-compatible config, but grow/digest no longer uses
+        # it to rewrite source subjects.
+        # 保留兼容旧配置，但 grow/digest 不再用它改写原文主语。
         # Supports both config.yaml and env var OMBRE_USER_NAME
         self.user_name = config.get("user_name", "") or os.environ.get("OMBRE_USER_NAME", "")
 
@@ -710,9 +717,7 @@ class Dehydrator:
         Call LLM API for diary organization.
         调用 LLM API 执行日记整理。
         """
-        # Format prompt with user_name from config
-        # 用 config 里的 user_name 填充 prompt 模板
-        prompt = DIGEST_PROMPT.format(name=self.user_name or "用户")
+        prompt = DIGEST_PROMPT
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -727,13 +732,13 @@ class Dehydrator:
         raw = response.choices[0].message.content or ""
         if not raw.strip():
             return []
-        return self._parse_digest(raw)
+        return self._parse_digest(raw, source_content=content)
 
     # ---------------------------------------------------------
     # Parse diary digest result with safety checks
     # 解析日记整理结果，做安全校验
     # ---------------------------------------------------------
-    def _parse_digest(self, raw: str) -> list[dict]:
+    def _parse_digest(self, raw: str, source_content: str = "") -> list[dict]:
         """
         Parse and validate API diary digest result.
         解析并校验 API 返回的日记整理结果。
@@ -766,7 +771,10 @@ class Dehydrator:
 
             validated.append({
                 "name": str(item.get("name", ""))[:20],
-                "content": self._clean_pronouns(str(item.get("content", ""))),
+                "content": self._clean_pronouns(
+                    str(item.get("content", "")),
+                    source_content=source_content,
+                ),
                 "domain": item.get("domain", ["未分类"])[:3],
                 "valence": valence,
                 "arousal": arousal,
@@ -776,25 +784,57 @@ class Dehydrator:
         return validated
 
     # ---------------------------------------------------------
-    # Pronoun safety net: replace report-style references
-    # 人称安全网：替换报告体称呼
+    # Pronoun safety net
+    # 人称安全网
     # ---------------------------------------------------------
-    def _clean_pronouns(self, text: str) -> str:
+    def _clean_pronouns(self, text: str, source_content: str = "") -> str:
         """
-        Replace report-style references with user_name.
-        Last-resort fix if the LLM ignores prompt instructions.
-        Only replaces terms that unambiguously refer to the memory subject.
-        如果脱水模型无视 prompt 指令，最后一道防线。
-        只替换明确指代记忆主体的报告体称呼，不动可能指其他人的词。
+        Replace report-style references with the subject found in source text.
+        Never falls back to user_name, because that can corrupt subject identity
+        when the source text is about someone else.
+        将报告体称呼替换成原文里识别出的主语。
+        绝不回退到 user_name，避免原文主体不是配置名时污染人称。
         """
-        if not self.user_name:
+        subject = self._infer_source_subject(source_content)
+        if not subject:
             return text
-        # Only terms that always mean the diary author / memory subject
-        # "该女士""该男士" etc. might refer to other people in the story
+
         bad_refs = ["作者", "当事人", "提问者", "该用户"]
         for ref in bad_refs:
-            text = text.replace(ref, self.user_name)
+            text = text.replace(ref, subject)
         return text
+
+    def _infer_source_subject(self, source_content: str) -> str:
+        """
+        Best-effort subject inference for grow pronoun cleanup.
+        Conservative by design: if the subject is unclear, return empty.
+        为 grow 的人称清理做保守主语识别：不确定就返回空。
+        """
+        if not source_content:
+            return ""
+
+        source = source_content.strip()
+        if not source:
+            return ""
+
+        source = source.lstrip("「『“\"'（([【 ")
+        first_sentence = re.split(r"[。！？!?；;\n]", source, maxsplit=1)[0][:80]
+
+        first_person_match = re.search(r"(咱们|我们|我|俺|咱)", first_sentence)
+        if first_person_match:
+            return first_person_match.group(0)
+
+        leading_name = re.match(
+            r"^([A-Za-z][A-Za-z0-9_. '-]{0,30}|[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9_·]{0,7})"
+            r"\s*(?:今天|昨天|前天|最近|刚刚|又|在|去|坐|和|跟|是|想|觉得|说|遇到|收到|做|买|吃|看|玩|开始|准备|需要|把|给|对|被)",
+            first_sentence,
+        )
+        if leading_name:
+            subject = leading_name.group(1).strip()
+            if subject not in {"今天", "昨天", "前天", "最近", "刚刚"}:
+                return subject
+
+        return ""
 
     # ---------------------------------------------------------
     # Local diary split (fallback when API is unavailable)
