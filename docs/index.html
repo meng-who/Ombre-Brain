@@ -160,6 +160,13 @@ function wOpacity(w,s) { if(s==="pinned")return 1;if(s==="feel")return.9;if(s===
 function domainStr(d) { return Array.isArray(d)?d.join(" · "):d||"" }
 function truncate(s, n) { if(!s)return""; return s.length>n?s.slice(0,n)+"...":s }
 function timeValue(b) { return Date.parse(b.last_active || b.created || "") || 0 }
+function displayName(b) {
+  const raw = String((b && b.name) || "");
+  const cleaned = raw
+    .replace(/^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}[-:]\d{2}[-:]\d{2}\s+/, "")
+    .replace(/^\s*\d{4}-\d{2}-\d{2}\s+/, "");
+  return cleaned || raw || ((b && b.id) || "");
+}
 
 // ==================== DATA ====================
 async function connectAndLoad() {
@@ -215,6 +222,7 @@ function getFiltered() {
   const q = document.getElementById("search").value.toLowerCase().trim();
   if (q) items = items.filter(b =>
     (b.name||"").toLowerCase().includes(q) ||
+    displayName(b).toLowerCase().includes(q) ||
     domainStr(b.domain).toLowerCase().includes(q) ||
     (b.tags||[]).some(t => t.toLowerCase().includes(q)) ||
     (b.content||"").toLowerCase().includes(q)
@@ -265,7 +273,7 @@ function renderGrid() {
         '<span class="card-status mono" style="color:'+c.color+'">'+c.statusLabel+'</span>' +
         (dom ? '<span class="card-domain mono">'+dom+'</span>' : "") +
       '</div>' +
-      '<div class="card-name">'+b.name+'</div>' +
+      '<div class="card-name">'+displayName(b)+'</div>' +
       (desc ? '<div class="card-desc">'+desc+'</div>' : '') +
       '<div class="card-bottom">'+impBar(b.importance)+
         '<div class="metrics"><span><span class="v-dot" style="background:'+vColor(b.valence)+'"></span> <span class="metric-text mono">'+vLabel(b.valence)+'</span></span>'+wt+'</div>' +
@@ -291,7 +299,7 @@ function openModal(id) {
   document.getElementById("modal").innerHTML =
     '<div class="modal-header"><div>' +
       '<span class="modal-status mono" style="color:'+c.color+'">'+c.label+'</span>' +
-      '<div class="modal-name">'+b.name+'</div></div>' +
+      '<div class="modal-name">'+displayName(b)+'</div></div>' +
       '<button class="close-btn" onclick="closeModal()">\u2715</button></div>' +
     (dom ? '<div class="modal-domain mono">'+dom+'</div>' : '') +
     '<div class="modal-content">'+(b.content||"\u65e0\u5185\u5bb9")+'</div>' +
