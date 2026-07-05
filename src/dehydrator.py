@@ -907,12 +907,15 @@ class Dehydrator:
                 importance = _DEFAULT_IMPORTANCE
             valence, arousal = self._clamp_va(item)
 
+            cleaned_content = self._clean_digest_pronouns(
+                raw_content,
+                source_content=source_content,
+            )
+            cleaned_content = self._repair_ai_self_reference(cleaned_content)
+
             validated.append({
                 "name": raw_name[:_NAME_MAX_CHARS],
-                "content": self._clean_digest_pronouns(
-                    raw_content,
-                    source_content=source_content,
-                ),
+                "content": cleaned_content,
                 "domain": item.get("domain", ["未分类"])[:_DOMAIN_MAX],
                 "valence": valence,
                 "arousal": arousal,
@@ -938,6 +941,39 @@ class Dehydrator:
             if title and body:
                 return title, body
         return "", text
+
+    def _repair_ai_self_reference(self, text: str) -> str:
+        """
+        Fix impossible digest phrasing such as "我和Cy" when Cy is the AI.
+        This only touches first-person + AI_NAME self references; ordinary
+        third-party names and source subjects are left unchanged.
+        """
+        if not text:
+            return text
+
+        ai_name = os.environ.get("AI_NAME", "").strip()
+        human = self.human
+        if isinstance(human, dict):
+            human = human.get("name", "")
+        human = str(human or "").strip()
+        if not human or human == "用户":
+            human = os.environ.get("OMBRE_USER_NAME", "").strip() or human
+
+        if not ai_name or not human or ai_name == human:
+            return text
+
+        escaped_ai = re.escape(ai_name)
+        replacements = (
+            (rf"我\s*和\s*{escaped_ai}", f"我和{human}"),
+            (rf"{escaped_ai}\s*和\s*我", f"{human}和我"),
+            (rf"我\s*跟\s*{escaped_ai}", f"我跟{human}"),
+            (rf"{escaped_ai}\s*跟\s*我", f"{human}跟我"),
+            (rf"我\s*与\s*{escaped_ai}", f"我与{human}"),
+            (rf"{escaped_ai}\s*与\s*我", f"{human}与我"),
+        )
+        for pattern, replacement in replacements:
+            text = re.sub(pattern, replacement, text)
+        return text
 
     def _clean_digest_pronouns(self, text: str, source_content: str = "") -> str:
         """
