@@ -890,6 +890,14 @@ class Dehydrator:
         for item in items:
             if not isinstance(item, dict) or not item.get("content"):
                 continue
+            raw_name = str(item.get("name", "")).strip()
+            raw_content = str(item.get("content", "")).strip()
+            if not raw_name:
+                raw_name, raw_content = self._extract_leading_title(raw_content)
+            else:
+                extracted_name, stripped_content = self._extract_leading_title(raw_content)
+                if extracted_name and extracted_name.strip() == raw_name.strip():
+                    raw_content = stripped_content
             try:
                 importance = max(
                     _IMPORTANCE_MIN,
@@ -900,9 +908,9 @@ class Dehydrator:
             valence, arousal = self._clamp_va(item)
 
             validated.append({
-                "name": str(item.get("name", ""))[:_NAME_MAX_CHARS],
+                "name": raw_name[:_NAME_MAX_CHARS],
                 "content": self._clean_digest_pronouns(
-                    str(item.get("content", "")),
+                    raw_content,
                     source_content=source_content,
                 ),
                 "domain": item.get("domain", ["未分类"])[:_DOMAIN_MAX],
@@ -912,6 +920,24 @@ class Dehydrator:
                 "importance": importance,
             })
         return validated
+
+    def _extract_leading_title(self, text: str) -> tuple[str, str]:
+        """Promote a leading title line from model output into bucket name."""
+        if not text:
+            return "", text
+        patterns = (
+            r"^\s*(?:标题|题目|名称|title|name)\s*[:：]\s*(?P<title>[^\r\n]{1,40})\s*(?:\r?\n)+(?P<body>.*)\Z",
+            r"^\s*#{1,3}\s*(?P<title>[^\r\n#]{1,40})\s*(?:\r?\n)+(?P<body>.*)\Z",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            title = match.group("title").strip().strip("\"'“”‘’`")
+            body = match.group("body").strip()
+            if title and body:
+                return title, body
+        return "", text
 
     def _clean_digest_pronouns(self, text: str, source_content: str = "") -> str:
         """
