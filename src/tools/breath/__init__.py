@@ -33,6 +33,8 @@ from .importance import surface_by_importance
 from .surface import surface_default
 from .search import surface_search
 
+_MAX_QUERY_CHARS = 300
+
 
 async def dispatch(
     query: Optional[str] = "",
@@ -46,6 +48,9 @@ async def dispatch(
 ) -> str:
     # --- Null-safe coercion ---
     if query is None: query = ""
+    query = str(query).strip()
+    if len(query) > _MAX_QUERY_CHARS:
+        query = query[:_MAX_QUERY_CHARS].strip()
     if max_tokens is None: max_tokens = 0
     if domain is None: domain = ""
     if valence is None: valence = -1
