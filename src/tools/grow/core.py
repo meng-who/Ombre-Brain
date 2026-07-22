@@ -8,7 +8,7 @@ tools/grow/core.py — grow 长内容主路径（digest + merge）
 
 关键行为：
 - digest 失败（API key 不可用）时直接 RuntimeError，不创建任何桶
-- 逐条调 merge_or_create（grow 路径用 LLM merge，会压缩老+新）
+- 逐条调 merge_or_create；合并旧桶时保留 digest 正文，不再让 LLM 二次改写主语
 - iter 2.0：每次 grow 调用生成一个 ``grow_batch_id``，同批次新建桶共享，
   source_tool 一律为 ``grow``；合并到的老桶不改 source_tool
 - 单条失败不影响其他；按字节上限校验单条尺寸
@@ -77,6 +77,7 @@ async def grow_core(content: str) -> str:
                 valence=item.get("valence") or 0.5,
                 arousal=item.get("arousal") or 0.3,
                 name=item.get("name", ""),
+                raw_merge=True,
                 source_tool="grow",
                 grow_batch_id=batch_id,
             )

@@ -979,13 +979,13 @@ class Dehydrator:
         )
         if not raw.strip():
             return []
-        return self._parse_digest(raw)
+        return self._parse_digest(raw, source_content=content)
 
     # ---------------------------------------------------------
     # Parse diary digest result with safety checks
     # 解析日记整理结果，做安全校验
     # ---------------------------------------------------------
-    def _parse_digest(self, raw: str) -> list[dict]:
+    def _parse_digest(self, raw: str, source_content: str = "") -> list[dict]:
         """
         Parse and validate API diary digest result.
         解析并校验 API 返回的日记整理结果。
@@ -1004,6 +1004,14 @@ class Dehydrator:
         for item in items:
             if not isinstance(item, dict) or not item.get("content"):
                 continue
+            raw_name = str(item.get("name", "")).strip()
+            raw_content = str(item.get("content", "")).strip()
+            if not raw_name:
+                raw_name, raw_content = self._extract_leading_title(raw_content)
+            else:
+                extracted_name, stripped_content = self._extract_leading_title(raw_content)
+                if extracted_name and extracted_name.strip() == raw_name.strip():
+                    raw_content = stripped_content
             try:
                 importance = max(
                     _IMPORTANCE_MIN,
@@ -1013,9 +1021,16 @@ class Dehydrator:
                 importance = _DEFAULT_IMPORTANCE
             valence, arousal = self._clamp_va(item)
 
+            cleaned_name = self._repair_ai_self_reference(raw_name)
+            cleaned_content = self._clean_digest_pronouns(
+                raw_content,
+                source_content=source_content,
+            )
+            cleaned_content = self._repair_ai_self_reference(cleaned_content)
+
             validated.append({
-                "name": str(item.get("name", ""))[:_NAME_MAX_CHARS],
-                "content": str(item.get("content", "")),
+                "name": cleaned_name[:_NAME_MAX_CHARS],
+                "content": cleaned_content,
                 "domain": item.get("domain", ["未分类"])[:_DOMAIN_MAX],
                 "valence": valence,
                 "arousal": arousal,
@@ -1023,6 +1038,101 @@ class Dehydrator:
                 "importance": importance,
             })
         return validated
+
+    def _extract_leading_title(self, text: str) -> tuple[str, str]:
+        """Promote a leading title line from model output into bucket name."""
+        if not text:
+            return "", text
+        patterns = (
+            r"^\s*(?:标题|题目|名称|title|name)\s*[:：]\s*(?P<title>[^\r\n]{1,40})\s*(?:\r?\n)+(?P<body>.*)\Z",
+            r"^\s*#{1,3}\s*(?P<title>[^\r\n#]{1,40})\s*(?:\r?\n)+(?P<body>.*)\Z",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            title = match.group("title").strip().strip("\"'“”‘’`")
+            body = match.group("body").strip()
+            if title and body:
+                return title, body
+        return "", text
+
+    def _repair_ai_self_reference(self, text: str) -> str:
+        """Repair impossible first-person references to the configured AI name."""
+        if not text:
+            return text
+
+        ai_names = [
+            os.environ.get("AI_NAME", "").strip(),
+            os.environ.get("OMBRE_AI_NAME", "").strip(),
+        ]
+        human = self.human
+        if isinstance(human, dict):
+            human = human.get("name", "")
+        human = str(human or "").strip()
+        if not human or human == "用户":
+            human = os.environ.get("OMBRE_USER_NAME", "").strip() or human
+
+        ai_names = [name for name in dict.fromkeys(ai_names) if name and name != human]
+        if not ai_names or not human:
+            return text
+
+        joiners = "和跟与"
+        for ai_name in ai_names:
+            escaped_ai = re.escape(ai_name)
+            replacements = (
+                (rf"我\s*和\s*{escaped_ai}", f"我和{human}"),
+                (rf"{escaped_ai}\s*和\s*我", f"{human}和我"),
+                (rf"我\s*跟\s*{escaped_ai}", f"我跟{human}"),
+                (rf"{escaped_ai}\s*跟\s*我", f"{human}跟我"),
+                (rf"我\s*与\s*{escaped_ai}", f"我与{human}"),
+                (rf"{escaped_ai}\s*与\s*我", f"{human}与我"),
+                (rf"与\s*{escaped_ai}(?=[\u4e00-\u9fffA-Za-z0-9])", f"与{human}"),
+                (rf"和\s*{escaped_ai}(?=[\u4e00-\u9fffA-Za-z0-9])", f"和{human}"),
+                (rf"跟\s*{escaped_ai}(?=[\u4e00-\u9fffA-Za-z0-9])", f"跟{human}"),
+            )
+            for pattern, replacement in replacements:
+                text = re.sub(pattern, replacement, text)
+            text = re.sub(
+                rf"(?<![{joiners}]){escaped_ai}(?=\s*测试)",
+                human,
+                text,
+            )
+        return text
+
+    def _clean_digest_pronouns(self, text: str, source_content: str = "") -> str:
+        """Replace report-style placeholders without rewriting valid subjects."""
+        if not text:
+            return text
+
+        subject = self._infer_source_subject(source_content)
+        if not subject:
+            return text
+        for reference in ("作者", "当事人", "提问者", "该用户"):
+            text = text.replace(reference, subject)
+        return text
+
+    def _infer_source_subject(self, source_content: str) -> str:
+        """Infer only an explicit leading source subject; return empty if unclear."""
+        if not source_content:
+            return ""
+        source = source_content.strip().lstrip("「『“\"'（([【 ")
+        if not source:
+            return ""
+        first_sentence = re.split(r"[。！？!?；;\n]", source, maxsplit=1)[0][:80]
+        first_person = re.search(r"(咱们|我们|我|俺|咱)", first_sentence)
+        if first_person:
+            return first_person.group(0)
+        leading_name = re.match(
+            r"^([A-Za-z][A-Za-z0-9_. '-]{0,30}|[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9_·]{0,7})"
+            r"\s*(?:今天|昨天|前天|最近|刚刚|又|在|去|坐|和|跟|是|想|觉得|说|遇到|收到|做|买|吃|看|玩|开始|准备|需要|把|给|对|被)",
+            first_sentence,
+        )
+        if leading_name:
+            subject = leading_name.group(1).strip()
+            if subject not in {"今天", "昨天", "前天", "最近", "刚刚"}:
+                return subject
+        return ""
 
     # ---------------------------------------------------------
     # API call: judge whether a new event resolves an active plan

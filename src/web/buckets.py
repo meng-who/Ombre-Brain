@@ -167,6 +167,44 @@ def register(mcp) -> None:
             return JSONResponse({"error": str(e)}, status_code=500)
 
 
+    @mcp.custom_route("/api/pulse", methods=["GET"])
+    async def api_pulse(request: Request) -> Response:
+        """Legacy public endpoint used by the GitHub Pages memory viewer."""
+        from starlette.responses import JSONResponse
+        try:
+            all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
+            stats = await sh.bucket_mgr.get_stats()
+            buckets_out = []
+            for bucket in all_buckets:
+                meta = bucket.get("metadata", {})
+                if meta.get("deleted_at"):
+                    continue
+                score = sh.decay_engine.calculate_score(meta)
+                buckets_out.append({
+                    "id": bucket["id"],
+                    "name": meta.get("name", ""),
+                    "content": strip_wikilinks(bucket.get("content", "")),
+                    "domain": meta.get("domain", []),
+                    "tags": meta.get("tags", []),
+                    "importance": meta.get("importance", 5),
+                    "valence": meta.get("valence", 0.5),
+                    "arousal": meta.get("arousal", 0.5),
+                    "weight": round(score, 2),
+                    "pinned": bool(meta.get("pinned") or meta.get("protected")),
+                    "resolved": bool(meta.get("resolved")),
+                    "type": meta.get("type", "dynamic"),
+                    "created": meta.get("created", ""),
+                    "last_active": meta.get("last_active", ""),
+                })
+            buckets_out.sort(
+                key=lambda item: item.get("last_active") or item.get("created") or "",
+                reverse=True,
+            )
+            return JSONResponse({"stats": stats, "buckets": buckets_out})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+
     @mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
     async def api_bucket_detail(request: Request) -> Response:
         """Get full raw bucket content plus display-only derived text by ID."""

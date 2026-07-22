@@ -4031,7 +4031,7 @@ async function testSamplingBreath() {
       return;
     }
     out.innerHTML = '本次浮现：<br/>' + items.map((b, i) => {
-      const nm = esc(b.name || b.id || '(无名)');
+      const nm = esc(displayBucketName(b.name, b.id || '(无名)'));
       const sc = (b.score != null) ? ' · ' + Number(b.score).toFixed(3) : '';
       return (i + 1) + '. ' + nm + sc;
     }).join('<br/>');
@@ -4179,6 +4179,15 @@ async function readJsonSafe(resp) {
 const BASE = location.origin;
 let allBuckets = [];
 let currentFilter = 'all';
+
+function displayBucketName(name, fallback) {
+  var raw = String(name || '');
+  var cleaned = raw
+    .replace(/^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}[-:]\d{2}[-:]\d{2}\s+/, '')
+    .replace(/^\s*\d{4}-\d{2}-\d{2}\s+/, '');
+  return cleaned || raw || fallback || '';
+}
+
 var BUCKET_SORT_MODES = ['score', 'created_desc', 'created_asc'];
 var bucketSort = 'score';
 try {
@@ -4588,7 +4597,7 @@ function _paintBuckets() {
       '<div class="bucket-row-top">' +
         '<input class="bucket-select" type="checkbox" data-id="' + escAttr(b.id) + '" onclick="event.stopPropagation()" onchange="toggleBucketSelection(this.dataset.id,this.checked)"' + (selectedBucketIds.has(b.id) ? ' checked' : '') + '>' +
         '<span class="' + iconCls + '">' + iconHtml + '</span>' +
-        '<span class="name" title="' + escAttr(b.name) + '">' + esc(b.name) + firstBadge + '</span>' +
+        '<span class="name" title="' + escAttr(b.name) + '">' + esc(displayBucketName(b.name, b.id)) + firstBadge + '</span>' +
         '<div class="bucket-row-tags">' +
           domainHtml +
           emotionHtml +
@@ -4680,12 +4689,12 @@ async function showDetail(id) {
         '<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">这条触发了 ' + b.triggered_feels.length + ' 条 feel：</div>' +
         '<ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.8;">' +
         b.triggered_feels.map(function(f) {
-          return '<li><a href="#" data-bucket-id="' + escAttr(f.id) + '" onclick="showDetail(this.dataset.bucketId);return false" style="color:var(--accent);text-decoration:none;">' + esc(f.name) + '</a></li>';
+          return '<li><a href="#" data-bucket-id="' + escAttr(f.id) + '" onclick="showDetail(this.dataset.bucketId);return false" style="color:var(--accent);text-decoration:none;">' + esc(displayBucketName(f.name, f.id)) + '</a></li>';
         }).join('') +
         '</ul></div>';
     }
     content.innerHTML =
-      '<h2>' + esc(meta.name || id) + firstBadge + '</h2>' +
+      '<h2>' + esc(displayBucketName(meta.name, id)) + firstBadge + '</h2>' +
       whyHtml +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + esc(id) + '</div>' +
@@ -4771,7 +4780,7 @@ function renderForgottenGroup(forgotten) {
   listEl.innerHTML = forgotten.map(function(b) {
     return '<div class="bucket-row" style="opacity:0.6;">' +
       '<span class="icon"><i data-lucide="eye-off"></i></span>' +
-      '<span class="name" data-bucket-id="' + escAttr(b.id) + '" onclick="showDetail(this.dataset.bucketId)" style="cursor:pointer;">' + esc(b.name) + '</span>' +
+      '<span class="name" data-bucket-id="' + escAttr(b.id) + '" onclick="showDetail(this.dataset.bucketId)" style="cursor:pointer;" title="' + escAttr(b.name) + '">' + esc(displayBucketName(b.name, b.id)) + '</span>' +
       '<span class="domain">' + esc((b.domain || []).join(', ')) + '</span>' +
       '<span class="time">' + esc(formatTimeAgo(b.last_active || b.created)) + '</span>' +
       '<button data-bucket-id="' + escAttr(b.id) + '" onclick="bucketAllowOne(this.dataset.bucketId)" title="允许浮现" style="font-size:11px;padding:2px 6px;margin-left:auto;display:inline-flex;align-items:center;"><i data-lucide="eye" style="width:12px;height:12px;"></i></button>' +
