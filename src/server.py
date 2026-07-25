@@ -16,14 +16,14 @@ web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/too
 - Dashboard / HTTP 路由全部已拆分到 src/web/<域>.py（每个模块 register(mcp)），
   本文件仅在启动时调用 web.register_all(mcp) 装配；共享依赖见 web/_shared.py
 - 仍保留在本文件：进程启动、引擎初始化、GitHub 后台同步循环、Webhook 推送、
-  MCP Bearer 鉴权中间件、单连接器 /mcp 装配（启动入口处把 mcp_extra 工具回灌进 mcp）、uvicorn 拉起
+  MCP Bearer 鉴权中间件、单连接器 /mcp 装配、uvicorn 拉起
 
 不做什么（边界）：
 - 不在这里写 hold/breath/dream 等业务逻辑（全在 tools/* 下）
 - 不写 HTTP 路由处理（全在 web/* 下）；不写 LLM prompt（dehydrator 负责）
 - 不直接读写桶文件（bucket_manager 负责）
 
-对外暴露：mcp/mcp_extra 两个实例 + 14 个 @mcp*.tool() 函数；HTTP 路由在 src/web/*
+对外暴露：mcp 单实例 + 14 个 @mcp.tool() 函数；HTTP 路由在 src/web/*
 ========================================
 """
 
@@ -301,21 +301,19 @@ _gh_auto_interval: int = int(_gh_cfg.get("auto_interval_minutes") or 0)
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
 #
-# iter 2.2：合并回单连接器 /mcp（claude.ai 5 工具上限已解除）。
-# 历史上（iter 2.1）曾拆成主 mcp(/mcp) + 副 mcp_extra(/mcp-extra) 两个实例。
-# 现在只对外暴露主实例 mcp 的一条 /mcp 路由；mcp_extra 仅作工具分组容器保留
-# （7 个 @mcp_extra.tool() 注册不动），启动入口处把它的工具回灌进 mcp 统一暴露。
-# 两个实例共享同一进程、同一 runtime、同一 bucket_mgr；HTTP custom_route（dashboard、API）
-# 全部挂在 mcp 主实例上。
+# iter 2.2 后对外只有单连接器 /mcp。2.8.5 起 14 个工具全部直接注册到
+# 这一实例，不再依赖 FastMCP 私有注册表的启动期合并，导入式 ASGI 启动也能
+# 稳定暴露完整工具清单。
+#
+# 远程 Streamable HTTP 固定返回单个 JSON-RPC 对象，并且不要求客户端在
+# initialize 后保存/回传 Mcp-Session-Id。Kelivo 等会静默吞掉 tools/list 异常的
+# 客户端因此不会再出现“已连接但 0 工具”。stdio 与 legacy SSE 不受这两项影响。
 mcp = FastMCP(
     "Ombre Brain",
     host=_BIND_HOST,
     port=OMBRE_PORT,
-)
-mcp_extra = FastMCP(
-    "Ombre Brain Extra",
-    host=_BIND_HOST,
-    port=OMBRE_PORT,
+    json_response=True,
+    stateless_http=True,
 )
 
 
@@ -411,7 +409,7 @@ _wsh.init_runtime(
 # 所有可能含 PII 的字段（content / 信件正文等）只记 length，不记内容。
 # =============================================================
 def _fmt_log_val(v: object) -> str:
-    """日志 value 的安全格式化：bool/int/float 原样；str 截 40 字符并去换行；其它转 str。"""
+    """日志 value 的安全格式化：文本只记长度，绝不记录用户原文。"""
     if v is None:
         return "_"
     if isinstance(v, bool):
@@ -419,8 +417,10 @@ def _fmt_log_val(v: object) -> str:
     if isinstance(v, (int, float)):
         return str(v)
     if isinstance(v, str):
-        s = v.replace("\n", "\\n").replace(" ", "_")
-        return s if len(s) <= 40 else s[:37] + "..."
+        # query、署名、标题、domain/tag 乃至 bucket_id 都可能含私密内容或
+        # CR/ANSI 控制字符。结构化操作日志只需要知道字段是否存在和规模，
+        # 不应把文本复制到全局日志，再由另一次失败回传给别的 MCP 客户端。
+        return f"str_len:{len(v)}"
     return type(v).__name__
 
 
@@ -440,9 +440,33 @@ def _log_op_ok(op: str, result: object) -> None:
     logger.info(f"op={op} phase=ok bytes={size}")
 
 
+def _safe_exception_type(exc: BaseException) -> str:
+    """只保留可安全写入响应与日志的 ASCII 异常类型名。"""
+    raw_type = type(exc).__name__
+    safe_type = "".join(
+        char
+        for char in raw_type
+        if char.isascii() and (char.isalnum() or char == "_")
+    )[:80]
+    return safe_type or "Exception"
+
+
 def _log_op_err(op: str, exc: BaseException) -> None:
-    # 用 .exception 让 traceback 进 server.log，便于事后定位
-    logger.exception(f"op={op} phase=err err={type(exc).__name__}:{exc}")
+    # 异常正文和 traceback 可能含密钥 URL、本机路径及调用参数，服务日志
+    # 只记录安全化类型；详细排障使用同一时间点附近的独立结构化事件。
+    logger.error(
+        "op=%s phase=err err_type=%s detail=hidden",
+        op,
+        _safe_exception_type(exc),
+    )
+
+
+def _safe_exception_detail(exc: BaseException) -> str:
+    """异常对外或持久化前只保留类型与泛化说明。"""
+    return (
+        f"{_safe_exception_type(exc)}: 工具执行失败；"
+        "异常正文已隐藏，以保护密钥、本机路径与调用内容。"
+    )
 
 
 async def _with_notice(coro: Awaitable[str], op: str = "", args: dict | None = None) -> str:
@@ -451,8 +475,8 @@ async def _with_notice(coro: Awaitable[str], op: str = "", args: dict | None = N
     职责（统一错误规范）：
     1. 入口：begin_warnings() 初始化本调用的 W/I channel。
     2. 出口：拼接顺序 = [删除通知] + [工具正文] + [本调用产生的 W/I 提示].
-    3. 异常：捕获后 record OB-E004，返回标准格式（含最近 15 条 log），
-       不让 MCP 协议层看到裸异常字符串。
+    3. 异常：捕获后 record OB-E004，响应、持久错误与日志只保留异常类型和
+       泛化说明，不能复制异常正文或 traceback。
     4. 任务A：op 非空时，在 entry/ok/err 三处打结构化日志。
     """
     if op:
@@ -465,10 +489,21 @@ async def _with_notice(coro: Awaitable[str], op: str = "", args: dict | None = N
             _log_op_err(op, e)
         # OB-E004：MCP 工具执行异常 —— 不静默，给 LLM 一个能看懂的字符串
         try:
-            record_error("OB-E004", f"{type(e).__name__}: {e}")
-            err_str = format_error("OB-E004", f"{type(e).__name__}: {e}")
+            detail = _safe_exception_detail(e)
+            record_error("OB-E004", detail)
+            err_str = format_error(
+                "OB-E004",
+                detail,
+                include_logs=False,
+            )
         except Exception:
-            err_str = f"❌ [OB-E004] MCP 工具执行异常\n{type(e).__name__}: {e}"
+            # 错误格式化器本身失效时也不能退回未净化的异常原文。
+            # 例如 provider 异常可能含密钥 URL、CRLF 或 ANSI 控制序列。
+            try:
+                fallback_detail = _safe_exception_detail(e)
+            except Exception:
+                fallback_detail = "Exception: 工具执行失败；异常正文已隐藏。"
+            err_str = f"❌ [OB-E004] MCP 工具执行异常\n{fallback_detail}"
         # 仍把通道里已累计的提示拼上
         try:
             extras = format_warnings_suffix(pop_warnings())
@@ -783,7 +818,20 @@ except (AttributeError, RuntimeError, TypeError, ValueError) as _trace_schema_ex
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
+async def dream(window_hours: Optional[int] = 48) -> str:
+    """读取最近 window_hours（默认 48h）内有变动的所有记忆桶,用于回顾与消化。
+    每个桶返回其在窗口内的最新内容（按 last_active 取）,完整正文不截断。
+    可据此操作：放下的 → trace(resolved=1) 沉底；有沉淀的 → hold(feel=True, source_bucket=...) 记录；无沉淀则不操作。
+    候选桶超过 40 时按 decay_engine.calculate_score() 排序取前 40，避免一次返回过多。"""
+    return await _with_notice(
+        _t_dream.dispatch(window_hours=window_hours),
+        op="dream",
+        args={"window_hours": window_hours},
+    )
+
+
+@mcp.tool()
 async def anchor(bucket_id: str) -> str:
     """把指定桶标记为 anchor(坐标系)。anchor 不主动出现在默认 breath，但 query/domain/emotion 命中时仍返回。硬上限 24，已满时拒绝并提示先 release。"""
     return await _with_notice(
@@ -793,7 +841,7 @@ async def anchor(bucket_id: str) -> str:
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def release(bucket_id: str) -> str:
     """解除指定桶的 anchor 标记。桶恢复为普通状态，重新参与默认 breath；pinned 状态保留。"""
     return await _with_notice(
@@ -803,7 +851,7 @@ async def release(bucket_id: str) -> str:
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def pulse(include_archive: Optional[bool] = False) -> str:
     """返回记忆系统状态摘要:固化/动态/归档/feel/plan/letter 数量、总占用、衰减引擎运行状态,以及所有桶的摘要列表。include_archive=True 同时返回归档区。"""
     return await _with_notice(
@@ -813,7 +861,7 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def plan(
     content: str,
     status: Optional[str] = "active",
@@ -836,7 +884,7 @@ async def plan(
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def letter_write(
     author: str,
     content: str,
@@ -860,7 +908,7 @@ async def letter_write(
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def letter_read(
     query: Optional[str] = "",
     limit: Optional[int] = 10,
@@ -882,7 +930,7 @@ async def letter_read(
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def I(
     content: Optional[str] = "",
     aspect: Optional[str] = "",
@@ -897,21 +945,46 @@ async def I(
     )
 
 
-@mcp.tool()
-async def dream(window_hours: Optional[int] = 48) -> str:
-    """读取最近 window_hours（默认 48h）内有变动的所有记忆桶,用于回顾与消化。
-    每个桶返回其在窗口内的最新内容（按 last_active 取）,完整正文不截断。
-    可据此操作：放下的 → trace(resolved=1) 沉底；有沉淀的 → hold(feel=True, source_bucket=...) 记录；无沉淀则不操作。
-    候选桶超过 40 时按 decay_engine.calculate_score() 排序取前 40，避免一次返回过多。"""
-    return await _with_notice(
-        _t_dream.dispatch(window_hours=window_hours),
-        op="dream",
-        args={"window_hours": window_hours},
-    )
+# Pydantic 默认的 ``extra=ignore`` 会让拼错的 MCP 参数看似调用成功；
+# 写工具甚至会在未应用客户端目标字段时仍创建记忆。breath 和 trace
+# 已有严格适配层，其余公开工具使用相同边界，并同步 FastMCP
+# 的发现 schema 缓存与运行时校验器。
+def _forbid_unknown_tool_arguments(tool_name: str) -> None:
+    public_tool = mcp._tool_manager.get_tool(tool_name)
+    if public_tool is None:
+        raise RuntimeError(f"registered {tool_name} tool is missing")
+    arg_model = public_tool.fn_metadata.arg_model
+    arg_model.model_config["extra"] = "forbid"
+    arg_model.model_rebuild(force=True)
+    public_tool.parameters = arg_model.model_json_schema()
+
+
+for _strict_tool_name in (
+    "breath_search",
+    "breath_advanced",
+    "hold",
+    "grow",
+    "dream",
+    "anchor",
+    "release",
+    "pulse",
+    "plan",
+    "letter_write",
+    "letter_read",
+    "I",
+):
+    try:
+        _forbid_unknown_tool_arguments(_strict_tool_name)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as _schema_exc:
+        logger.warning(
+            "%s strict-argument adapter unavailable: %s",
+            _strict_tool_name,
+            _schema_exc,
+        )
 
 
 # =============================================================
-# Dashboard API endpoints (for lightweight Web UI)
+# Dashboard API 端点（供轻量 Web UI 使用）
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
 # =============================================================
@@ -960,30 +1033,11 @@ if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
 
-    # iter 2.2：合并为单连接器 /mcp。
-    # 当初（iter 2.1）拆 /mcp + /mcp-extra 是因为 claude.ai 连接器存在 5 工具上限；
-    # 该上限现已解除，14 个工具全部挂在主实例 mcp 上对外暴露一条 /mcp 即可，
-    # 顺带消除「第二个连接器」在 Claude.ai 侧的 OAuth/连接器校验疑难。
-    # mcp_extra 仅作历史工具分组容器保留（7 个 @mcp_extra.tool() 注册不动），
-    # 这里把它的工具回灌进 mcp，让 stdio / sse / streamable-http 三种 transport 一致。
-    # 依赖 FastMCP._tool_manager 私有结构；若未来版本变化，降级为仅暴露主集 7 工具。
     from server_app import (
         HTTPRuntimeSettings,
         RuntimeLifecycle,
         build_http_app,
-        merge_mcp_tool_registries,
     )
-
-    try:
-        _extra_count = merge_mcp_tool_registries(mcp, mcp_extra)
-        logger.info(
-            f"单连接器 /mcp：已把 {_extra_count} 个副集工具回灌进主实例，共 "
-            f"{len(mcp._tool_manager._tools)} 个工具对外暴露"
-        )
-    except AttributeError as _merge_exc:
-        logger.warning(
-            f"FastMCP 内部结构变化，工具回灌失败，仅暴露主集 7 工具：{_merge_exc}"
-        )
 
     if transport in ("sse", "streamable-http"):
         import uvicorn
@@ -1070,11 +1124,14 @@ if __name__ == "__main__":
             logger.info(f"Listening on :{OMBRE_PORT} (bare-metal / 裸机默认 18001)")
         # 明确打印「客户端该怎么连」——给 Operit / 安卓 / 自建前端等非技术用户排障用。
         # 一眼能看清 endpoint 路径、鉴权开关；本机桥接务必用 127.0.0.1（见上方保活注释）。
+        _endpoint_path = "/sse" if transport == "sse" else "/mcp"
         logger.info(
-            "MCP endpoint ready | transport=%s | 本机连接 URL: http://127.0.0.1:%s/mcp "
-            "（远程走你的域名/隧道，末尾同样是 /mcp）| 鉴权: %s",
+            "MCP endpoint ready | transport=%s | 本机连接 URL: http://127.0.0.1:%s%s "
+            "（远程走你的域名/隧道，末尾同样是 %s）| 鉴权: %s",
             transport,
             OMBRE_PORT,
+            _endpoint_path,
+            _endpoint_path,
             (
                 "开启(需静态 Token)" if _http_settings.auth_mode == "token"
                 else "开启(需 OAuth Bearer)"
@@ -1092,5 +1149,5 @@ if __name__ == "__main__":
             proxy_headers=False,
         )
     else:
-        # stdio：工具已在启动入口处统一回灌进 mcp（14 个全暴露），这里直接跑。
+        # stdio：14 个工具已直接注册在唯一 mcp 实例上，这里直接运行即可。
         mcp.run(transport=transport)
