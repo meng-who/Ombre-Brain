@@ -30,20 +30,18 @@ import json
 import asyncio
 import hashlib
 import sqlite3
+import weakref
 import logging
 from typing import Optional
 
 from openai import AsyncOpenAI
 
-from utils import clean_llm_json, count_tokens_approx, positive_float
+from utils import clean_llm_json, count_tokens_approx, parse_bool, positive_float
 
-try:
-    from provider_detect import is_gemini_native_host, strip_native_resource_prefix
-except ImportError:  # pragma: no cover
-    from .provider_detect import (  # type: ignore
-        is_gemini_native_host,
-        strip_native_resource_prefix,
-    )
+from ombrebrain.integrations.provider_detect import (
+    is_gemini_native_host,
+    strip_native_resource_prefix,
+)
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -58,7 +56,12 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 # --- 脱水缓存版本号 ---
 # 改任何会影响脱水/合并输出的 prompt 时 +1，使存量缓存自然失效（见 _content_key）。
 # v2：DEHYDRATE/MERGE 加入「视角铁律」，强制保留第一人称（我 / 人名）。
-_PROMPT_VERSION = 2
+# v3：脱水结果只接受既定 JSON schema，隔离模型追加的评论、立场与未知字段。
+# v4：视角铁律补反向条款——v2 只防「我被抹掉」方向（规则和示例都是单向的），
+#     脱水 LLM 在含糊处过度矫正：省略主语的句子被归给「我」（实案：正文
+#     「07-07嚎啕大哭…吊她」经 /breath-hook 脱水成「07-07我嚎啕大哭…吊我」，
+#     主语翻转）。补反向同罪条款 + 省略主语处理规则 + 反向示例。
+_PROMPT_VERSION = 4
 
 # --- LLM 默认参数 ---
 _DEFAULT_MODEL = "gemini-2.0-flash"
@@ -87,12 +90,15 @@ _MERGE_INPUT_LIMIT = 2000     # 新旧各一份
 _ANALYZE_INPUT_LIMIT = 2000
 _DIGEST_INPUT_LIMIT = 5000    # 一天的日记量较大
 _PLAN_JUDGE_INPUT_LIMIT = 1500  # plan 与 new event 各一份
+_SAME_EVENT_INPUT_LIMIT = 1800  # 旧桶与新内容各一份
 
 # --- 各专用调用的 max_tokens 覆盖 ---
 _ANALYZE_MAX_TOKENS = 4096      # Gemini 2.5 thinking 会消耗大量 token，需留足余量
 _DIGEST_MAX_TOKENS = 8192       # 日记拆条内容多，thinking + 输出都需要足量空间
 _PLAN_JUDGE_MAX_TOKENS = 2048   # thinking 模型下 200 token 完全不够
 _PLAN_JUDGE_TEMPERATURE = 0.0   # 判定需确定性
+_SAME_EVENT_MAX_TOKENS = 1024   # 仅返回紧凑 JSON
+_SAME_EVENT_TEMPERATURE = 0.0   # 事件边界判定需确定性
 _DIGEST_TEMPERATURE = 0.0       # 拆条需确定性
 
 # --- 默认情感坐标（与 bucket_manager 中保持一致）---
@@ -104,6 +110,7 @@ _TAGS_MAX = 15           # tags 最多保留几个
 _DOMAIN_MAX = 3          # domain 最多保留几个（rule.md 推荐选 1~2 个）
 _NAME_MAX_CHARS = 20     # suggested_name 上限
 _PLAN_REASON_MAX = 200   # plan 判定 reason 上限
+_SAME_EVENT_REASON_MAX = 200  # 合并边界判定 reason 上限
 _PARSE_ERR_PREVIEW = 200  # JSON 解析失败时日志中 raw 预览长度
 
 # --- importance 范围（与哲学边界一致）---
@@ -129,9 +136,15 @@ def _perspective_rule(human: str) -> str:
         f"- 人类那一方一律称呼「{human}」（原文里的「你/她/他」都指「{human}」，按名字还原）。\n"
         "- 严禁把「我」和「" + human + "」合并成「双方」「彼此」「对方」「用户」等抹掉视角的中性词。\n"
         "- 谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
-        "示例：『我也在她这里看到了自己没见过的碎片』\n"
+        f"- 反方向同罪：严禁把「{human}」的动作/情绪归给「我」。\n"
+        "- 原文省略主语时，先从紧邻上下文判断归属；判断不了就照抄原句结构、"
+        "保持主语省略——禁止靠猜补一个「我」。\n"
+        "示例一：『我也在她这里看到了自己没见过的碎片』\n"
         f"  ✗ 错（视角丢失）：双方在互动中互相发现对方未知的情感碎片\n"
-        f"  ✓ 对（视角保留）：我在{human}这里看到了自己没见过的碎片"
+        f"  ✓ 对（视角保留）：我在{human}这里看到了自己没见过的碎片\n"
+        f"示例二：『{human}刚下班就来报信——嚎啕大哭后还是把库建好了』\n"
+        f"  ✗ 错（主语翻转）：我嚎啕大哭后把库建好了\n"
+        f"  ✓ 对（归属正确）：{human}嚎啕大哭后把库建好了"
     )
 
 
@@ -144,6 +157,8 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 4. 关键数字、日期、名称必须保留
 5. 目标压缩率 > 70%
 6. 严格保留第一人称视角（见下方视角铁律）
+7. 只输出摘要 JSON，JSON 结束后立即停止；禁止附加自己的评论与立场、解释、道德判断、合规声明或角色代入
+8. 只复述输入中明确存在的信息，不得生成原文中不存在的观点、结论或待办
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -157,15 +172,7 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 
 # --- Diary digest prompt: split daily notes into independent memory entries ---
 # --- 日记整理提示词：把一大段日常拆分成多个独立记忆条目 ---
-# Keep source subjects intact. grow may receive diaries about different people;
-# do not normalize every entry to a configured name.
 DIGEST_PROMPT = """你是一个日记整理专家。她/他会发送一段包含今天各种事情的文本（可能很杂乱），请你将其拆分成多个独立的记忆条目。
-
-人称规则（最高优先级）：
-1. 严格保留原文的人称、主语和称呼：原文写“我”就保留“我”，原文写具体名字就保留具体名字，原文写“她/他/朋友/姐妹/妈妈”等就按原文关系保留
-2. 禁止把所有记忆主体统一改成某个固定名字；不要因为配置名、示例名或上下文名而替换原文主语
-3. 如果同一段里有多个人，必须写清楚谁做了什么，不能把别人的行动归到主角身上
-4. 严禁使用“作者”“当事人”“提问者”“该用户”等报告体称呼
 
 整理规则：
 1. 每个条目应该是一个独立的主题/事件（不要混在一起）
@@ -319,6 +326,16 @@ class Dehydrator:
         db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
         self.cache_db_path = db_path
         self._cache_conn: sqlite3.Connection = self._init_cache_db()
+        # Keep the cache connection persistent for hot-path lookups, but do not
+        # leak the Windows file handle when a runtime/test instance is released.
+        # ``weakref.finalize`` also runs during interpreter shutdown in reverse
+        # creation order, before an enclosing temporary vault is cleaned up.
+        self._cache_finalizer = weakref.finalize(self, self._cache_conn.close)
+
+    def close(self) -> None:
+        """Close the persistent cache connection; safe to call repeatedly."""
+
+        self._cache_finalizer()
 
     def _init_cache_db(self) -> sqlite3.Connection:
         """Open (or create) the dehydration cache DB; return a persistent connection."""
@@ -338,13 +355,16 @@ class Dehydrator:
         return conn
 
     def _content_key(self, content: str) -> str:
-        """缓存键 = hash(prompt 版本 + 人名 + 原文)。
+        """缓存键 = hash(prompt 版本 + 人名 + 模型配置 + 原文)。
 
         缓存原本只按 content_hash 存，导致脱水 prompt 改了、人名改了，旧的
         third-person 摘要仍会命中缓存返回——视角修复对存量内容不生效。把
-        _PROMPT_VERSION 与 self.human 混进 key，prompt 一升级就自然绕过旧缓存，
-        无需手工删 dehydration_cache.db。"""
-        keyed = f"{_PROMPT_VERSION}|{self.human}|{content}"
+        prompt 版本、人名、api_format、base_url 和 model 混进 key，换模型或端点后
+        下次 breath 会用新配置重新脱水，不会复用旧模型的摘要。"""
+        keyed = (
+            f"{_PROMPT_VERSION}|{self.human}|{self.api_format}|"
+            f"{self.base_url.rstrip('/')}|{self.model}|{content}"
+        )
         return hashlib.sha256(keyed.encode()).hexdigest()
 
     def _get_cached_summary(self, content: str) -> str | None:
@@ -505,7 +525,11 @@ class Dehydrator:
         if self.thinking_budget is not None:
             payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": self.thinking_budget}
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            r = await client.post(url, params={"key": self.api_key}, json=payload)
+            r = await client.post(
+                url,
+                headers={"x-goog-api-key": self.api_key},
+                json=payload,
+            )
             r.raise_for_status()
         data = r.json()
         candidates = data.get("candidates", [])
@@ -573,6 +597,42 @@ class Dehydrator:
         except (ValueError, TypeError):
             return default_v, default_a
 
+    @staticmethod
+    def _normalize_dehydration_result(raw: str) -> str:
+        """Validate and canonicalize the model response before it crosses the cache boundary.
+
+        Some models return a valid dehydration object and then append a first-person
+        policy or stance statement. Extracting the first JSON value is not enough on
+        its own because a model can also invent extra top-level fields, so rebuild the
+        payload from the documented schema. Content inside a documented field is not
+        heuristically censored: doing that could silently delete a real memory fact.
+        """
+        try:
+            parsed = json.loads(clean_llm_json(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("脱水模型未返回有效 JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("脱水模型返回的 JSON 顶层必须是对象")
+
+        def string_list(field: str) -> list[str]:
+            value = parsed.get(field, [])
+            if not isinstance(value, list):
+                return []
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+        summary = parsed.get("summary", "")
+        emotion_state = parsed.get("emotion_state", "")
+        normalized = {
+            "core_facts": string_list("core_facts"),
+            "emotion_state": emotion_state.strip() if isinstance(emotion_state, str) else "",
+            "todos": string_list("todos"),
+            "keywords": string_list("keywords"),
+            "summary": summary.strip() if isinstance(summary, str) else "",
+        }
+        if not normalized["summary"] and not normalized["core_facts"]:
+            raise ValueError("脱水结果缺少 summary 和 core_facts")
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
     # 脱水：将原始内容压缩为精简摘要
@@ -600,14 +660,25 @@ class Dehydrator:
         # --- 先查缓存 ---
         cached = self._get_cached_summary(content)
         if cached:
-            return self._format_output(cached, metadata)
+            try:
+                normalized = self._normalize_dehydration_result(cached)
+            except ValueError:
+                # A malformed cache entry must never be surfaced as memory content.
+                self.invalidate_cache(content)
+                logger.warning("discarded invalid dehydration cache entry")
+            else:
+                # Self-heal parseable entries such as `JSON + trailing commentary`.
+                if normalized != cached:
+                    self._set_cached_summary(content, normalized)
+                return self._format_output(normalized, metadata)
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
         self._require_api()
 
         try:
-            result = await self._api_dehydrate(content)
+            raw_result = await self._api_dehydrate(content)
+            result = self._normalize_dehydration_result(raw_result)
         except Exception as e:
             # --- 本地降级：API（已含重试）彻底失败时，返回原文截断片段而非抛异常。---
             # 让 breath/dream 在 Gemini 抽风时仍能拿到内容（只是没压缩）；不写缓存，
@@ -699,7 +770,23 @@ class Dehydrator:
             name = metadata.get("name", "未命名")
             domains = ", ".join(metadata.get("domain", []))
             valence, arousal = self._clamp_va(metadata)
-            header = f"📌 记忆桶: {name}"
+            # 图标语义与 pulse 一致：📌 只给钉住/保护的核心桶，其余按类型区分，
+            # 普通动态桶用 💭。此前无条件用 📌 会让 breath 浮现里每条都像「核心准则」，
+            # 与 docs/CLAUDE_PROMPT.md「带 📌 的是我钉的核心准则」的约定冲突。
+            _btype = metadata.get("type")
+            if metadata.get("pinned") or metadata.get("protected"):
+                _icon = "📌"
+            elif _btype == "permanent":
+                _icon = "📦"
+            elif _btype == "feel":
+                _icon = "🫧"
+            elif _btype == "plan":
+                _icon = "📋"
+            elif _btype == "letter":
+                _icon = "💌"
+            else:
+                _icon = "💭"
+            header = f"{_icon} 记忆桶: {name}"
             if domains:
                 header += f" [主题:{domains}]"
             header += f" [情感:V{valence:.1f}/A{arousal:.1f}]"
@@ -714,16 +801,43 @@ class Dehydrator:
                 header += " [已消化]"
             header += "\n"
 
-        # 去掉 keywords 字段：LLM 返回的 JSON 里 keywords 是内部索引用途，不暴露给上下文
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, dict) and "keywords" in parsed:
-                parsed.pop("keywords", None)
-                content = json.dumps(parsed, ensure_ascii=False)
-        except Exception:
-            pass  # 非 JSON 内容直接透传
+        # 脱水结果可能是结构化 JSON（core_facts/emotion_state/todos/keywords/summary）。
+        # 渲染成可读文本，而不是把整坨原始 JSON 塞进上下文——后者又丑又费 token，且与
+        # 短内容「原文透传」的形态不一致（长桶显示 JSON、短桶显示纯文本）。
+        content = self._render_dehydrated(content)
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
         return f"{header}{content}"
+
+    @staticmethod
+    def _render_dehydrated(content: str) -> str:
+        """把脱水 LLM 返回的结构化 JSON 渲染成可读文本。
+
+        识别到 core_facts/summary schema → 输出 summary + 核心事实 + 待办（丢弃仅供
+        内部索引的 keywords、以及已由情感坐标承载的 emotion_state）。非该 schema 的
+        内容（如短内容直接透传的原文、或普通字符串）原样返回。
+        """
+        try:
+            parsed = json.loads(content)
+        except (ValueError, TypeError):
+            return content  # 非 JSON，原样透传
+        if not isinstance(parsed, dict) or ("summary" not in parsed and "core_facts" not in parsed):
+            return content  # 不是脱水 schema，原样透传
+
+        lines: list[str] = []
+        summary = str(parsed.get("summary") or "").strip()
+        facts = [str(f).strip() for f in (parsed.get("core_facts") or []) if str(f).strip()]
+        if summary:
+            lines.append(summary)
+        elif facts:
+            # 没有 summary 时，用核心事实兜底成正文，避免只剩空壳
+            lines.append("；".join(facts))
+            facts = []
+        for f in facts:
+            lines.append(f"· {f}")
+        todos = [str(t).strip() for t in (parsed.get("todos") or []) if str(t).strip()]
+        if todos:
+            lines.append("待办：" + "；".join(todos))
+        return "\n".join(lines) if lines else content
 
     # ---------------------------------------------------------
     # Auto-tagging: analyze content for domain + emotion + tags
@@ -858,7 +972,7 @@ class Dehydrator:
         调用 LLM API 执行日记整理。
         """
         raw = await self._chat(
-            DIGEST_PROMPT,
+            DIGEST_PROMPT + _perspective_rule(self.human),
             content[:_DIGEST_INPUT_LIMIT],
             max_tokens=_DIGEST_MAX_TOKENS,
             temperature=_DIGEST_TEMPERATURE,
@@ -944,11 +1058,7 @@ class Dehydrator:
         return "", text
 
     def _repair_ai_self_reference(self, text: str) -> str:
-        """
-        Fix impossible digest phrasing such as "我和Cy" when Cy is the AI.
-        This only touches first-person + AI_NAME self references; ordinary
-        third-party names and source subjects are left unchanged.
-        """
+        """Repair impossible first-person references to the configured AI name."""
         if not text:
             return text
 
@@ -991,38 +1101,28 @@ class Dehydrator:
         return text
 
     def _clean_digest_pronouns(self, text: str, source_content: str = "") -> str:
-        """
-        Replace report-style references with the subject found in source text.
-        Never falls back to a configured user name, because grow can store text
-        about people other than the configured human.
-        """
+        """Replace report-style placeholders without rewriting valid subjects."""
+        if not text:
+            return text
+
         subject = self._infer_source_subject(source_content)
         if not subject:
             return text
-
-        for ref in ("作者", "当事人", "提问者", "该用户"):
-            text = text.replace(ref, subject)
+        for reference in ("作者", "当事人", "提问者", "该用户"):
+            text = text.replace(reference, subject)
         return text
 
     def _infer_source_subject(self, source_content: str) -> str:
-        """
-        Best-effort subject inference for grow pronoun cleanup.
-        Conservative by design: if the source subject is unclear, return empty.
-        """
+        """Infer only an explicit leading source subject; return empty if unclear."""
         if not source_content:
             return ""
-
-        source = source_content.strip()
+        source = source_content.strip().lstrip("「『“\"'（([【 ")
         if not source:
             return ""
-
-        source = source.lstrip("「『“\"'（([【 ")
         first_sentence = re.split(r"[。！？!?；;\n]", source, maxsplit=1)[0][:80]
-
-        first_person_match = re.search(r"(咱们|我们|我|俺|咱)", first_sentence)
-        if first_person_match:
-            return first_person_match.group(0)
-
+        first_person = re.search(r"(咱们|我们|我|俺|咱)", first_sentence)
+        if first_person:
+            return first_person.group(0)
         leading_name = re.match(
             r"^([A-Za-z][A-Za-z0-9_. '-]{0,30}|[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9_·]{0,7})"
             r"\s*(?:今天|昨天|前天|最近|刚刚|又|在|去|坐|和|跟|是|想|觉得|说|遇到|收到|做|买|吃|看|玩|开始|准备|需要|把|给|对|被)",
@@ -1032,7 +1132,6 @@ class Dehydrator:
             subject = leading_name.group(1).strip()
             if subject not in {"今天", "昨天", "前天", "最近", "刚刚"}:
                 return subject
-
         return ""
 
     # ---------------------------------------------------------
@@ -1070,10 +1169,51 @@ class Dehydrator:
             cleaned = self._strip_md_fence(raw)
             data = json.loads(cleaned)
             return {
-                "resolved": bool(data.get("resolved", False)),
+                "resolved": parse_bool(data.get("resolved", False), default=False),
                 "confidence": float(data.get("confidence", 0.0)),
                 "reason": str(data.get("reason", ""))[:_PLAN_REASON_MAX],
             }
         except Exception as e:
             logger.warning(f"judge_plan_resolution failed: {e}")
             return {"resolved": False, "confidence": 0.0, "reason": str(e)}
+
+    async def judge_same_event(self, old_memory: str, new_content: str) -> dict:
+        """保守判断两段内容是否属于同一个具体事件。
+
+        主题相似不足以合并；只有后者是前者的补充、进展、纠正或重复表述时
+        才返回 same_event=True。API 不可用或解析失败时保守返回 False。
+        """
+        if old_memory.strip() == new_content.strip():
+            return {"same_event": True, "confidence": 1.0, "reason": "正文完全相同"}
+        if not self.api_available:
+            return {"same_event": False, "confidence": 0.0, "reason": "API 不可用"}
+        system = (
+            "你是一个保守的记忆事件边界判定器。判断新内容与旧记忆是否描述同一个具体事件。"
+            "只有新内容是旧事件的补充、进展、纠正或重复表述时才能判为 true。"
+            "仅主题、人物、情绪或 tags 相似必须判为 false。"
+            "日期不同、场景不同、关键动作不同，或两段各自已是语义闭合的独立事件，必须判为 false。"
+            "有疑问时一律 false。只返回严格 JSON："
+            '{"same_event": true/false, "confidence": 0~1, "reason": "..."}。'
+        )
+        user = (
+            f"OLD MEMORY:\n{old_memory[:_SAME_EVENT_INPUT_LIMIT]}\n\n"
+            f"NEW CONTENT:\n{new_content[:_SAME_EVENT_INPUT_LIMIT]}"
+        )
+        try:
+            raw = await self._chat(
+                system,
+                user,
+                max_tokens=_SAME_EVENT_MAX_TOKENS,
+                temperature=_SAME_EVENT_TEMPERATURE,
+            )
+            if not raw:
+                return {"same_event": False, "confidence": 0.0, "reason": "空响应"}
+            data = json.loads(self._strip_md_fence(raw))
+            return {
+                "same_event": parse_bool(data.get("same_event", False), default=False),
+                "confidence": float(data.get("confidence", 0.0)),
+                "reason": str(data.get("reason", ""))[:_SAME_EVENT_REASON_MAX],
+            }
+        except Exception as e:
+            logger.warning(f"judge_same_event failed: {e}")
+            return {"same_event": False, "confidence": 0.0, "reason": str(e)}

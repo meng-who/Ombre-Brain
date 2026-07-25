@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import heapq
+import hashlib
 import json
 import logging
 import math
@@ -43,23 +45,19 @@ from collections import OrderedDict
 from typing import Any
 
 import httpx
+import numpy as np
 from openai import AsyncOpenAI
 
 try:
-    from utils import positive_float
+    from utils import parse_bool, positive_float
 except ImportError:  # pragma: no cover
-    from .utils import positive_float  # type: ignore
+    from .utils import parse_bool, positive_float  # type: ignore
 
-try:
-    from provider_detect import (
-        normalize_model_for_endpoint,
-        strip_native_resource_prefix,
-    )
-except ImportError:  # pragma: no cover
-    from .provider_detect import (  # type: ignore
-        normalize_model_for_endpoint,
-        strip_native_resource_prefix,
-    )
+from ombrebrain.integrations.provider_detect import (
+    is_known_cloud_embedding_endpoint,
+    normalize_model_for_endpoint,
+    strip_native_resource_prefix,
+)
 
 logger = logging.getLogger("ombre_brain.embedding")
 
@@ -81,6 +79,19 @@ _MAX_INPUT_CHARS = 2000
 # 把这些重复请求拦在进程内，不用每次都打真实向量 API。
 _QUERY_CACHE_MAXSIZE = 32
 
+# SQLite stores vectors as JSON text.  Reading the whole table and converting
+# every row to Python floats before the matrix operation can briefly hold the
+# JSON strings, Python float objects and a second NumPy matrix at the same time.
+# Keep that peak independent of vault size (important on 512 MiB hosts).
+_SEARCH_BATCH_ROWS = 32
+
+
+def _provider_input_identity(text: str) -> str:
+    """为服务商实际可见的输入生成有界缓存标识。"""
+
+    provider_text = text[:_MAX_INPUT_CHARS]
+    return hashlib.sha256(provider_text.encode("utf-8")).hexdigest()
+
 
 def _norm_model(name: str) -> str:
     """归一化模型名用于「同一性」比较。
@@ -88,11 +99,19 @@ def _norm_model(name: str) -> str:
     Gemini OpenAI-compat 端点要求 "models/" 前缀，OpenAI 兼容代理（aihubmix /
     硅基流动等）用裸名——同一模型仅前缀不同。剥掉前缀 + 去空白 + 小写，
     让 model_name 的对账只看真实身份，不被书写约定误伤（修 OB-W005 假阳性）。
+    Ollama 的 ":latest" 是默认 tag：bge-m3 与 bge-m3:latest 是同一模型，
+    比较前剥掉结尾 ":latest"。仅剥这一个 tag——:q4_0 之类量化 tag 代表
+    不同的量化版本，是真实身份差异，不能剥。
     """
-    return strip_native_resource_prefix(name).lower()
+    return strip_native_resource_prefix(name).lower().removesuffix(":latest")
 
 
-def _humanize_api_error(e: Exception) -> str:
+def _humanize_api_error(
+    e: Exception,
+    *,
+    api_format: str = "openai_compat",
+    base_url: str = "",
+) -> str:
     """把 OpenAI 兼容后端的常见异常翻成可读中文提示，附在 OB-E001 detail 末尾。
 
     目的：让错误面板直接看懂 401/400/404/超时该怎么办，尤其跨境 provider 选错的
@@ -102,6 +121,15 @@ def _humanize_api_error(e: Exception) -> str:
     name = type(e).__name__
     code = getattr(e, "status_code", None)
     s = str(e).lower()
+    is_local = (api_format or "").strip().lower() in ("ollama", "local")
+    if is_local:
+        if code in (400, 404) or "badrequest" in name.lower() or "notfound" in name.lower():
+            return "→ 本地 Ollama 未找到或不支持该模型：确认 Ollama 已运行并已拉取 bge-m3。"
+        if "timeout" in name.lower() or "connect" in name.lower() or "timeout" in s:
+            return "→ 本地 Ollama 连接失败：确认服务已启动，且 Base URL 指向 Ollama 而不是云端 API。"
+        if code == 401 or "authentication" in name.lower() or "401" in s:
+            return "→ 本地 Ollama 返回 401：当前地址可能是需要鉴权的代理，而不是标准 Ollama 服务。"
+        return ""
     if code == 401 or "authentication" in name.lower() or "401" in s:
         return "→ 401：API key 无效或无权限，确认 key 正确且属于当前 base_url 的 provider。"
     if code == 404 or "notfound" in name.lower() or "404" in s:
@@ -167,14 +195,19 @@ class APIEmbeddingEngine(BaseEmbeddingEngine):
         model: str,
         dim: int = _GEMINI_DEFAULT_DIM,
         timeout_seconds: float = _API_TIMEOUT_SECONDS,
+        api_format: str = "openai_compat",
     ):
         self.api_key = api_key
         self.base_url = base_url
+        self.api_format = (api_format or "openai_compat").strip().lower()
+        self.backend_name = (
+            "ollama" if self.api_format in ("ollama", "local") else "api"
+        )
         self.timeout_seconds = positive_float(timeout_seconds, _API_TIMEOUT_SECONDS)
         # Google's OpenAI-compatible endpoint wants OpenAI-style bare model IDs.
         # Native REST uses the "models/" resource prefix, so normalize pasted
         # native IDs here before calling embeddings.create().
-        self.model = normalize_model_for_endpoint(model, base_url)
+        self.model = normalize_model_for_endpoint(model, base_url, self.api_format)
         self._dim = dim
         # 本地/容器 ollama 必须绕过系统代理。httpx 默认 trust_env=True 会读
         # 环境变量「以及 Windows 注册表/WinINET 系统代理」，于是 Clash/V2Ray 等
@@ -222,14 +255,18 @@ class APIEmbeddingEngine(BaseEmbeddingEngine):
             # 拿到了 2xx 响应但没有可用向量 —— 不能静默返回 []，否则向量化「成功
             # 调用却没结果」会无声无息（#3）。记 OB-E001 让错误面板可见。
             self._record_e001(
-                f"backend=api model={self.model} 返回空向量"
+                f"backend={self.backend_name} model={self.model} 返回空向量"
                 f"（base_url={self.base_url}，检查 model 名 / base_url / key 是否匹配该 provider）"
             )
             return []
         except Exception as e:
-            _hint = _humanize_api_error(e)
+            _hint = _humanize_api_error(
+                e,
+                api_format=self.api_format,
+                base_url=self.base_url,
+            )
             self._record_e001(
-                f"backend=api model={self.model} base_url={self.base_url} "
+                f"backend={self.backend_name} model={self.model} base_url={self.base_url} "
                 f"err={type(e).__name__}: {e}" + (f" {_hint}" if _hint else "")
             )
             return []
@@ -290,7 +327,11 @@ class GeminiNativeEmbeddingEngine(BaseEmbeddingEngine):
         payload = {"content": {"parts": [{"text": text[:_MAX_INPUT_CHARS]}]}}
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as c:
-                r = await c.post(url, params={"key": self.api_key}, json=payload)
+                r = await c.post(
+                    url,
+                    headers={"x-goog-api-key": self.api_key},
+                    json=payload,
+                )
                 r.raise_for_status()
             values = r.json().get("embedding", {}).get("values", [])
             if values and len(values) != self._dim:
@@ -328,7 +369,9 @@ class EmbeddingEngine:
 
     def __init__(self, config: dict):
         self.v3_runtime = None
-        # 进程内小容量 LRU：text -> embedding，去重短时间内的重复向量请求。
+        # 进程内小容量 LRU：provider 输入摘要 -> embedding。缓存键不能保留完整
+        # 桶正文；后端只会看到前 _MAX_INPUT_CHARS 个字符，identity 也必须遵守
+        # 同一个边界，否则长桶会白白滞留在 512 MiB 实例内存中。
         self._query_cache: "OrderedDict[str, list[float]]" = OrderedDict()
         embed_cfg = config.get("embedding", {}) or {}
         timeout_seconds = positive_float(embed_cfg.get("timeout_seconds"), _API_TIMEOUT_SECONDS)
@@ -337,7 +380,7 @@ class EmbeddingEngine:
         self.backend = "api"
 
         # 2) 解析 enabled。OB-F001：enabled=true 但 api_key 空，且后端是 api → 拒启
-        enabled_cfg = embed_cfg.get("enabled", True)
+        enabled_cfg = parse_bool(embed_cfg.get("enabled", True), default=True)
 
         # 3) 解析 SQLite 路径（允许测试 fixture 通过 db_path 覆盖）
         custom_db = (embed_cfg.get("db_path") or "").strip()
@@ -359,7 +402,10 @@ class EmbeddingEngine:
 
         # 解析 api_format（提前到 key 检查之前）。本地 ollama/local 后端无需真实 key，
         # 不能因为「key 为空」就被打到待机模式。
-        api_format = (embed_cfg.get("api_format") or "").strip() or os.environ.get("OMBRE_EMBED_FORMAT", "openai_compat")
+        api_format = (
+            (embed_cfg.get("api_format") or "").strip()
+            or os.environ.get("OMBRE_EMBED_FORMAT", "openai_compat")
+        ).lower()
         self.api_format = api_format
         is_local = api_format in ("ollama", "local")
 
@@ -368,7 +414,10 @@ class EmbeddingEngine:
             api_key = os.environ.get("OMBRE_EMBED_API_KEY", "").strip()
         # 本地模型没有 key 概念，但 OpenAI 客户端库要求 api_key 非空 → 补占位符。
         # 占位符会作为 Bearer 发给 ollama，ollama 不校验、照单全收。
-        if is_local and not api_key:
+        if is_local:
+            # Never forward a retained Gemini/SiliconFlow secret to a local or
+            # user-supplied Ollama URL. The real cloud key stays in config for
+            # switching back, but the local runtime uses a non-secret token.
             api_key = "ollama"
 
         if not api_key:
@@ -386,9 +435,16 @@ class EmbeddingEngine:
                 if os.path.exists("/.dockerenv")
                 else "http://127.0.0.1:11434/v1"
             )
+            configured_base = (embed_cfg.get("base_url") or "").strip()
+            if configured_base and is_known_cloud_embedding_endpoint(configured_base):
+                logger.warning(
+                    "[embedding] local mode ignored stale cloud base_url=%s",
+                    configured_base,
+                )
+                configured_base = ""
             base_url = (
-                (embed_cfg.get("base_url") or "").strip()
-                or os.environ.get("OMBRE_OLLAMA_URL", "").strip()
+                os.environ.get("OMBRE_OLLAMA_URL", "").strip()
+                or configured_base
                 or _local_default
             )
             model = embed_cfg.get("model") or "bge-m3"
@@ -403,6 +459,7 @@ class EmbeddingEngine:
                 model=model,
                 dim=dim,
                 timeout_seconds=timeout_seconds,
+                api_format=api_format,
             )
         elif api_format == "gemini":
             model = embed_cfg.get("model") or "gemini-embedding-001"
@@ -432,6 +489,7 @@ class EmbeddingEngine:
                 model=model,
                 dim=dim,
                 timeout_seconds=timeout_seconds,
+                api_format=api_format,
             )
 
         self.model = self._backend.model_name()
@@ -455,9 +513,25 @@ class EmbeddingEngine:
                 CREATE TABLE IF NOT EXISTS embeddings (
                     bucket_id TEXT PRIMARY KEY,
                     embedding TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT ''
                 )
             """)
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()
+            }
+            if "content_hash" not in columns:
+                conn.execute(
+                    "ALTER TABLE embeddings ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+                )
+            if "meaning_embedding" not in columns:
+                # Miss: meaning 的向量独立存一列，不与 content 的 embedding 混合生成，
+                # 否则长 content 会稀释掉一句话 meaning 的语义信号。NULL = 该桶未写
+                # meaning，或 meaning 向量化尚未成功（无需专门迁移历史桶）。
+                conn.execute(
+                    "ALTER TABLE embeddings ADD COLUMN meaning_embedding TEXT"
+                )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS embeddings_meta (
                     key TEXT PRIMARY KEY,
@@ -565,14 +639,15 @@ class EmbeddingEngine:
     async def _generate_async(self, text: str) -> list[float]:
         if not self._backend:
             return []
-        cached = self._query_cache.get(text)
+        cache_identity = _provider_input_identity(text)
+        cached = self._query_cache.get(cache_identity)
         if cached is not None:
-            self._query_cache.move_to_end(text)
+            self._query_cache.move_to_end(cache_identity)
             return list(cached)
         embedding = await self._backend.generate_async(text)
         if embedding:
-            self._query_cache[text] = list(embedding)
-            self._query_cache.move_to_end(text)
+            self._query_cache[cache_identity] = list(embedding)
+            self._query_cache.move_to_end(cache_identity)
             if len(self._query_cache) > _QUERY_CACHE_MAXSIZE:
                 self._query_cache.popitem(last=False)
         return embedding
@@ -585,13 +660,16 @@ class EmbeddingEngine:
             embedding = await self._generate_async(content)
             if not embedding:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            self._store_embedding(bucket_id, embedding, digest)
             return True
         except Exception as e:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
-    def _store_embedding(self, bucket_id: str, embedding: list[float]) -> None:
+    def _store_embedding(
+        self, bucket_id: str, embedding: list[float], content_hash: str = ""
+    ) -> None:
         try:
             from utils import now_iso  # type: ignore
         except ImportError:
@@ -599,8 +677,49 @@ class EmbeddingEngine:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-                (bucket_id, json.dumps(embedding), now_iso()),
+                """INSERT INTO embeddings (bucket_id, embedding, updated_at, content_hash)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(bucket_id) DO UPDATE SET
+                     embedding=excluded.embedding,
+                     updated_at=excluded.updated_at,
+                     content_hash=excluded.content_hash""",
+                (bucket_id, json.dumps(embedding), now_iso(), content_hash),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def generate_and_store_meaning(self, bucket_id: str, meaning_text: str) -> bool:
+        """Miss: 为 meaning（最近一条）单独生成并存储一份 embedding。
+
+        与 content 的向量分列存储，互不覆盖；桶可能还没有 content 向量行
+        （outbox 还在排队），所以用 upsert 而不是要求行已存在。
+        """
+        if not self.enabled or not meaning_text or not meaning_text.strip():
+            return False
+        try:
+            embedding = await self._generate_async(meaning_text)
+            if not embedding:
+                return False
+            self._store_meaning_embedding(bucket_id, embedding)
+            return True
+        except Exception as e:
+            logger.warning(f"Meaning embedding generation failed for {bucket_id}: {e}")
+            return False
+
+    def _store_meaning_embedding(self, bucket_id: str, embedding: list[float]) -> None:
+        try:
+            from utils import now_iso  # type: ignore
+        except ImportError:
+            from .utils import now_iso  # type: ignore
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """INSERT INTO embeddings (bucket_id, embedding, updated_at, content_hash, meaning_embedding)
+                   VALUES (?, '', ?, '', ?)
+                   ON CONFLICT(bucket_id) DO UPDATE SET
+                     meaning_embedding=excluded.meaning_embedding""",
+                (bucket_id, now_iso(), json.dumps(embedding)),
             )
             conn.commit()
         finally:
@@ -623,6 +742,62 @@ class EmbeddingEngine:
         finally:
             conn.close()
 
+    def delete_meaning_embedding(self, bucket_id: str) -> None:
+        """清空 meaning 派生列，保留同桶的 content 向量。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE embeddings SET meaning_embedding = NULL WHERE bucket_id = ?",
+                (bucket_id,),
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE bucket_id = ? "
+                "AND TRIM(embedding) = '' AND meaning_embedding IS NULL",
+                (bucket_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_content_ids(self) -> list[str]:
+        """Return IDs that have a real content vector, not only meaning data.
+
+        Rows created by ``generate_and_store_meaning`` deliberately contain an
+        empty ``embedding`` value until the durable content outbox catches up.
+        Legacy content rows, on the other hand, may have an empty
+        ``content_hash`` after the schema migration while still holding a valid
+        vector. Inspecting the vector column keeps those two states distinct.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT bucket_id FROM embeddings WHERE TRIM(embedding) <> ''"
+            ).fetchall()
+            return [str(row[0]) for row in rows]
+        finally:
+            conn.close()
+
+    def list_content_hashes(self) -> dict[str, str]:
+        """Return hashes recorded by new writes; legacy rows contain ``""``."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT bucket_id, content_hash FROM embeddings"
+            ).fetchall()
+            return {str(bucket_id): str(digest or "") for bucket_id, digest in rows}
+        finally:
+            conn.close()
+
+    def get_content_hash(self, bucket_id: str) -> str:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT content_hash FROM embeddings WHERE bucket_id = ?", (bucket_id,)
+            ).fetchone()
+            return str(row[0] or "") if row else ""
+        finally:
+            conn.close()
+
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         conn = sqlite3.connect(self.db_path)
         try:
@@ -640,40 +815,127 @@ class EmbeddingEngine:
 
     # -------------------- 搜索 --------------------
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        """返回 [(bucket_id, similarity)] 按相似度倒序。"""
+    async def search_similar_strict(
+        self, query: str, top_k: int = 10
+    ) -> list[tuple[str, float]]:
+        """Return ranked neighbors, surfacing provider failures to the caller."""
         if not self.enabled:
-            return []
+            raise RuntimeError("embedding is disabled")
+
+        # Preserve the old behaviour of not calling the provider for an empty
+        # index, without retaining any embedding payload across the await.
+        conn = sqlite3.connect(self.db_path)
         try:
-            query_embedding = await self._generate_async(query)
-            if not query_embedding:
-                return []
+            has_rows = conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        if not has_rows:
+            return []
+
+        query_embedding = await self._generate_async(query)
+        if not query_embedding:
+            raise RuntimeError("embedding provider returned an empty query vector")
+
+        if top_k <= 0:
+            return []
+
+        # Heap entries use (score, -SQLite row index, bucket_id).  Larger is
+        # better, so the min-heap root is always the worst retained candidate;
+        # for equal scores, later rows are worse.  This preserves the old
+        # stable-sort tie order while bounding ranking memory to O(top_k).
+        top_results: list[tuple[float, int, str]] = []
+        row_index = 0
+        query_dim = len(query_embedding)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.execute(
+                "SELECT bucket_id, embedding, meaning_embedding FROM embeddings"
+            )
+            while True:
+                rows = cursor.fetchmany(_SEARCH_BATCH_ROWS)
+                if not rows:
+                    break
+
+                bucket_ids: list[str] = []
+                best_scores: list[float | None] = []
+                candidate_vectors: list[list[float]] = []
+                candidate_owners: list[int] = []
+                for bucket_id, emb_json, meaning_emb_json in rows:
+                    # 一个桶可能同时有 content 向量和 meaning 向量，取相似度
+                    # 较高的一个。所有大对象都只活到当前小批次结束。
+                    owner = len(bucket_ids)
+                    bucket_ids.append(bucket_id)
+                    best_scores.append(None)
+                    for label, raw_embedding in (
+                        ("embedding", emb_json),
+                        ("meaning embedding", meaning_emb_json),
+                    ):
+                        if not raw_embedding:
+                            continue
+                        try:
+                            stored_embedding = json.loads(raw_embedding)
+                            if not isinstance(stored_embedding, list):
+                                raise TypeError(
+                                    f"embedding is {type(stored_embedding).__name__}, not list"
+                                )
+                            if not stored_embedding:
+                                continue
+                            stored_embedding = [float(value) for value in stored_embedding]
+                        except (json.JSONDecodeError, ValueError, TypeError) as _emb_exc:
+                            logger.warning(
+                                f"[embedding] Skipping malformed {label} for {bucket_id!r}: "
+                                f"{type(_emb_exc).__name__}: {_emb_exc}"
+                            )
+                            continue
+                        if len(stored_embedding) != query_dim:
+                            # Preserve the pairwise helper's existing contract:
+                            # a dimension mismatch contributes a 0.0 score.
+                            logger.warning(
+                                f"[embedding] {label} dimension mismatch for {bucket_id!r}: "
+                                f"stored={len(stored_embedding)}, query={query_dim}"
+                            )
+                            current = best_scores[owner]
+                            best_scores[owner] = (
+                                0.0 if current is None else max(current, 0.0)
+                            )
+                            continue
+                        candidate_vectors.append(stored_embedding)
+                        candidate_owners.append(owner)
+
+                if candidate_vectors:
+                    similarities = self._cosine_similarity_batch(
+                        query_embedding, candidate_vectors
+                    )
+                    for owner, similarity in zip(candidate_owners, similarities):
+                        score = float(similarity)
+                        current = best_scores[owner]
+                        best_scores[owner] = (
+                            score if current is None else max(current, score)
+                        )
+
+                for bucket_id, score in zip(bucket_ids, best_scores):
+                    current_index = row_index
+                    row_index += 1
+                    if score is None:
+                        continue
+                    entry = (score, -current_index, bucket_id)
+                    if len(top_results) < top_k:
+                        heapq.heappush(top_results, entry)
+                    elif entry > top_results[0]:
+                        heapq.heapreplace(top_results, entry)
+        finally:
+            conn.close()
+
+        top_results.sort(reverse=True)
+        return [(bucket_id, score) for score, _negative_index, bucket_id in top_results]
+
+    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+        """返回 [(bucket_id, similarity)]；失败时兼容旧调用方并返回空列表。"""
+        try:
+            return await self.search_similar_strict(query, top_k=top_k)
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
             return []
-
-        conn = sqlite3.connect(self.db_path)
-        try:
-            rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
-        finally:
-            conn.close()
-        if not rows:
-            return []
-
-        results: list[tuple[str, float]] = []
-        for bucket_id, emb_json in rows:
-            try:
-                stored_embedding = json.loads(emb_json)
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
-            except (json.JSONDecodeError, ValueError, TypeError) as _emb_exc:
-                logger.warning(
-                    f"[embedding] Skipping malformed embedding for {bucket_id!r}: "
-                    f"{type(_emb_exc).__name__}: {_emb_exc}"
-                )
-                continue
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
 
     async def search(self, query: str, top_k: int = 10) -> list[str]:
         """规范新接口：只返回 bucket_id 列表。"""
@@ -690,6 +952,22 @@ class EmbeddingEngine:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot / (norm_a * norm_b)
+
+    @staticmethod
+    def _cosine_similarity_batch(
+        query: list[float], vectors: list[list[float]]
+    ) -> "np.ndarray":
+        """Return cosine similarity for equally-sized vectors in one matrix pass."""
+        query_array = np.asarray(query, dtype=np.float64)
+        matrix = np.asarray(vectors, dtype=np.float64)
+        dots = matrix @ query_array
+        denominator = np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_array)
+        return np.divide(
+            dots,
+            denominator,
+            out=np.zeros_like(dots),
+            where=denominator != 0,
+        )
 
     # -------------------- 前端可读的状态 --------------------
 

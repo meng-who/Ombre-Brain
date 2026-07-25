@@ -1,10 +1,18 @@
+import asyncio
+import copy
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 import web.buckets as buckets_web
+import web.config_api as config_api
 import web.import_api as import_api
+import utils
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,11 +32,12 @@ class FakeMCP:
 
 
 class JsonRequest:
-    def __init__(self, body=None, *, path_params=None):
+    def __init__(self, body=None, *, path_params=None, method="POST"):
         self._body = body or {}
         self.path_params = path_params or {}
         self.headers = {}
         self.query_params = {}
+        self.method = method
 
     async def json(self):
         return self._body
@@ -118,6 +127,7 @@ async def test_grow_shortpath_explains_hold_style_single_memory(monkeypatch):
 @pytest.mark.asyncio
 async def test_host_vault_set_returns_restart_required_message(monkeypatch, tmp_path):
     monkeypatch.setattr(import_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(import_api.sh, "in_docker", lambda: False)
     monkeypatch.setattr(import_api.sh, "_project_env_path", lambda: str(tmp_path / ".env"))
     monkeypatch.setattr(import_api.sh, "_write_env_var", lambda _key, _value: None)
 
@@ -132,6 +142,52 @@ async def test_host_vault_set_returns_restart_required_message(monkeypatch, tmp_
     assert payload["ok"] is True
     assert payload["restart_required"] is True
     assert "重启" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_host_vault_set_rejects_container_local_fake_save(monkeypatch):
+    writes = []
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(import_api.sh, "in_docker", lambda: True)
+    monkeypatch.setattr(import_api.sh, "_write_env_var", lambda key, value: writes.append((key, value)))
+
+    mcp = FakeMCP()
+    import_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/host-vault")](
+        JsonRequest({"value": "D:/Vault/Ombre"})
+    )
+    payload = _json(response)
+
+    assert response.status_code == 409
+    assert payload["compose_managed"] is True
+    assert payload["restart_required"] is True
+    assert "compose" in payload["error"].lower()
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_host_vault_get_reports_compose_injected_value_in_container(monkeypatch):
+    monkeypatch.setattr(import_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(import_api.sh, "in_docker", lambda: True)
+    monkeypatch.setenv("OMBRE_HOST_VAULT_DIR", "D:/Vault/Ombre")
+    monkeypatch.setattr(
+        import_api.sh,
+        "_read_env_var",
+        lambda _name: pytest.fail("container must not read its local .env for a host mount"),
+    )
+
+    mcp = FakeMCP()
+    import_api.register(mcp)
+
+    response = await mcp.routes[("GET", "/api/host-vault")](JsonRequest())
+    payload = _json(response)
+
+    assert response.status_code == 200
+    assert payload["value"] == "D:/Vault/Ombre"
+    assert payload["source"] == "env"
+    assert payload["env_file"] is None
+    assert payload["compose_managed"] is True
 
 
 @pytest.mark.asyncio
@@ -174,7 +230,7 @@ def test_config_example_marks_wikilink_deprecated_without_active_stanza():
 
 
 def test_dashboard_single_bucket_delete_is_not_labeled_as_hard_delete():
-    for rel in ("dashboard.html", "frontend/dashboard.html"):
+    for rel in ("frontend/dashboard.html",):
         text = (ROOT / rel).read_text(encoding="utf-8")
 
         assert "删除到档案" in text
@@ -183,4 +239,661 @@ def test_dashboard_single_bucket_delete_is_not_labeled_as_hard_delete():
         assert "彻底删除这封信" not in text
         assert "你真的要永久删除这封信吗" not in text
         assert 'title="彻底删除"' not in text
-        assert "物理删除，不可恢复" in text
+        assert "/api/buckets/purge" not in text
+        assert "进入清理模式" not in text
+        assert "批量永久删除" not in text
+
+
+def test_dashboard_exposes_oauth_authentication_switch():
+    for rel in ("frontend/dashboard.html",):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+
+        assert 'id="cfg-mcp-auth"' in text
+        assert "开启 OAuth（Claude.ai 网页版 / Claude Code 远程需要）" in text
+        assert "saveMcpAuth()" in text
+        assert "mcp_require_auth: false, persist: true" in text
+        assert 'id="btn-restart"' in text
+        assert "restartService()" in text
+        assert "setRestartRequired(!!result.restart_required" in text
+
+
+def test_dashboard_exposes_mcp_static_token_mode():
+    for rel in ("frontend/dashboard.html",):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+
+        # 三态互斥：选 OAuth 就不认 Token，选 Token 就不认 OAuth。
+        assert '<option value="oauth">' in text
+        assert '<option value="token">' in text
+        assert '<option value="off">' in text
+        assert 'id="mcp-token-panel"' in text
+        assert "regenerateMcpToken()" in text
+        assert "/api/mcp-token/regenerate" in text
+        assert "Ombre-MCP-Token" in text
+
+
+@pytest.mark.asyncio
+async def test_dashboard_oauth_switch_persists_to_config(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", {"mcp_require_auth": True})
+    monkeypatch.setattr(utils, "config_file_path", lambda: str(config_path))
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest({"mcp_require_auth": False, "persist": True})
+    )
+    payload = _json(response)
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["restart_required"] is True
+    assert payload["mcp_require_auth_effective"] is True
+    # Startup-bound settings remain the effective runtime snapshot until restart.
+    assert config_api.sh.config["mcp_require_auth"] is True
+    assert persisted["mcp_require_auth"] is False
+
+
+@pytest.mark.asyncio
+async def test_dashboard_mcp_startup_settings_require_persistence_and_do_not_publish_on_failure(
+    monkeypatch,
+):
+    runtime = {"mcp_require_auth": True, "mcp_auth_mode": "oauth"}
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    not_persisted = await mcp.routes[("POST", "/api/config")](
+        JsonRequest({"mcp_require_auth": False})
+    )
+    assert not_persisted.status_code == 400
+    assert runtime == {"mcp_require_auth": True, "mcp_auth_mode": "oauth"}
+
+    monkeypatch.setattr(
+        config_api,
+        "atomic_update_config_yaml",
+        lambda _mutate: (_ for _ in ()).throw(OSError("read-only mount")),
+    )
+    failed = await mcp.routes[("POST", "/api/config")](
+        JsonRequest(
+            {
+                "mcp_require_auth": False,
+                "mcp_auth_mode": "token",
+                "persist": True,
+            }
+        )
+    )
+    assert failed.status_code == 500
+    assert runtime == {"mcp_require_auth": True, "mcp_auth_mode": "oauth"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_token_regenerate_write_failure_keeps_the_live_token(monkeypatch):
+    runtime = {"mcp_auth_mode": "token", "mcp_token": "old-live-token"}
+    monkeypatch.delenv("OMBRE_MCP_TOKEN", raising=False)
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(
+        config_api.secrets,
+        "token_urlsafe",
+        lambda _size: "new-uncommitted-token",
+    )
+    monkeypatch.setattr(
+        config_api,
+        "atomic_update_config_yaml",
+        lambda _mutate: (_ for _ in ()).throw(OSError("read-only config mount")),
+    )
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/mcp-token/regenerate")](JsonRequest())
+
+    assert response.status_code == 500
+    assert "persist failed" in _json(response)["error"]
+    assert runtime == {"mcp_auth_mode": "token", "mcp_token": "old-live-token"}
+    assert b"new-uncommitted-token" not in response.body
+
+
+def test_mcp_token_regenerate_serializes_disk_and_runtime_commit_across_loops(
+    monkeypatch,
+):
+    runtime = {"mcp_auth_mode": "token", "mcp_token": "old-token"}
+    persisted = {"mcp_token": "old-token"}
+    thread_state = threading.local()
+    first_persisted = threading.Event()
+    second_attempting = threading.Event()
+    second_persisted = threading.Event()
+    release_first = threading.Event()
+
+    def next_token(_size):
+        return thread_state.token
+
+    def persist(mutate):
+        candidate = copy.deepcopy(persisted)
+        mutate(candidate)
+        persisted.clear()
+        persisted.update(candidate)
+        if candidate["mcp_token"] == "token-a":
+            first_persisted.set()
+            assert release_first.wait(5), "first token commit was not released"
+        else:
+            second_persisted.set()
+        return candidate
+
+    monkeypatch.delenv("OMBRE_MCP_TOKEN", raising=False)
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(config_api.secrets, "token_urlsafe", next_token)
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", persist)
+    mcp = FakeMCP()
+    config_api.register(mcp)
+    handler = mcp.routes[("POST", "/api/mcp-token/regenerate")]
+
+    def invoke(token, attempting=None):
+        thread_state.token = token
+        if attempting is not None:
+            attempting.set()
+        return asyncio.run(handler(JsonRequest()))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(invoke, "token-a")
+        try:
+            assert first_persisted.wait(3), "first token never reached persistence"
+            second = executor.submit(invoke, "token-b", second_attempting)
+            assert second_attempting.wait(3), "second token request did not start"
+            assert not second_persisted.wait(0.5), (
+                "second token persisted before the first runtime publish"
+            )
+        finally:
+            release_first.set()
+        first_response = first.result(timeout=5)
+        second_response = second.result(timeout=5)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert persisted["mcp_token"] == "token-b"
+    assert runtime["mcp_token"] == persisted["mcp_token"]
+
+
+@pytest.mark.parametrize(
+    "invalid_update",
+    [
+        {"merge_threshold": -1},
+        {"merge_threshold": 101},
+        {"merge_threshold": True},
+        {"merge_threshold": 1.5},
+        {"host_port": 0},
+        {"host_port": 65536},
+        {"dehydration": {"max_tokens": 127}},
+        {"dehydration": {"temperature": float("nan")}},
+        {"dehydration": {"temperature": float("inf")}},
+        {"dehydration": {"temperature": True}},
+        {"dehydration": {"timeout_seconds": 0}},
+        {"surfacing": {"breath_max_results": 0}},
+        {"surfacing": {"breath_max_tokens": 499}},
+        {"surfacing": {"feel_max_tokens": 20001}},
+        {"surfacing": {"sampling": {"top_k": 0}}},
+        {"surfacing": {"sampling": {"sample_k": 21}}},
+        {"surfacing": {"sampling": {"temperature": float("nan")}}},
+        {"surfacing": {"sampling": {"temperature": float("inf")}}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_dashboard_config_rejects_nonfinite_and_out_of_range_numbers_atomically(
+    monkeypatch,
+    invalid_update,
+):
+    runtime = {
+        "merge_threshold": 75,
+        "host_port": 8000,
+        "dehydration": {"temperature": 0.2},
+        "surfacing": {"breath_max_results": 20},
+    }
+    original = copy.deepcopy(runtime)
+    persistence_calls = []
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(
+        config_api,
+        "atomic_update_config_yaml",
+        lambda mutate: persistence_calls.append(mutate),
+    )
+    mcp = FakeMCP()
+    config_api.register(mcp)
+    body = copy.deepcopy(invalid_update)
+    body["persist"] = True
+
+    response = await mcp.routes[("POST", "/api/config")](JsonRequest(body))
+
+    assert response.status_code == 400
+    assert runtime == original
+    assert persistence_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_config_persists_validated_numeric_types(monkeypatch):
+    runtime = {"merge_threshold": 75, "host_port": 8000, "surfacing": {}}
+    persisted = {}
+
+    def persist(mutate):
+        target = {}
+        mutate(target)
+        persisted.update(target)
+        return target
+
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", persist)
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest(
+            {
+                "merge_threshold": "42",
+                "host_port": "8123",
+                "surfacing": {
+                    "breath_max_results": "11",
+                    "breath_max_tokens": "12000",
+                    "feel_max_tokens": "7000",
+                    "sampling": {
+                        "enabled": True,
+                        "top_k": "9",
+                        "sample_k": "3",
+                        "temperature": "0.8",
+                    },
+                },
+                "persist": True,
+            }
+        )
+    )
+
+    assert response.status_code == 200
+    assert runtime["merge_threshold"] == 42
+    assert runtime["host_port"] == 8123
+    assert runtime["surfacing"] == {
+        "breath_max_results": 11,
+        "breath_max_tokens": 12000,
+        "feel_max_tokens": 7000,
+    }
+    assert persisted["merge_threshold"] == 42
+    assert persisted["host_port"] == 8123
+    assert persisted["surfacing"] == {
+        "breath_max_results": 11,
+        "breath_max_tokens": 12000,
+        "feel_max_tokens": 7000,
+        "sampling": {
+            "enabled": True,
+            "top_k": 9,
+            "sample_k": 3,
+            "temperature": 0.8,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_config_applies_zero_dehydration_temperature(monkeypatch):
+    runtime = {"dehydration": {"temperature": 0.3}}
+    dehydrator = SimpleNamespace(
+        model="model",
+        base_url="https://example.invalid/v1",
+        max_tokens=1024,
+        temperature=0.3,
+        timeout_seconds=60.0,
+        api_format="openai_compat",
+        api_key="",
+        api_available=False,
+        client=None,
+    )
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(config_api.sh, "dehydrator", dehydrator, raising=False)
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest({"dehydration": {"temperature": 0.0}})
+    )
+
+    assert response.status_code == 200
+    assert runtime["dehydration"]["temperature"] == 0.0
+    assert dehydrator.temperature == 0.0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_public_mcp_address_persists_round_trips_and_clears(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"deployment": {"profile": "advanced"}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        config_api.sh,
+        "config",
+        {"mcp_require_auth": True, "deployment": {"profile": "advanced"}},
+    )
+    monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(utils, "config_file_path", lambda: str(config_path))
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    saved = await mcp.routes[("POST", "/api/config")](
+        JsonRequest(
+            {
+                "deployment": {"public_url": "https://OB.Example:443/mcp"},
+                "persist": True,
+            }
+        )
+    )
+    saved_payload = _json(saved)
+    reloaded = await mcp.routes[("GET", "/api/config")](JsonRequest())
+
+    assert saved.status_code == 200
+    assert saved_payload["restart_required"] is True
+    assert saved_payload["deployment"]["public_url"] == "https://ob.example"
+    assert saved_payload["deployment"]["public_url_effective"] == ""
+    reloaded_payload = _json(reloaded)
+    assert reloaded_payload["deployment"]["public_url"] == "https://ob.example"
+    assert reloaded_payload["deployment"]["public_url_effective"] == ""
+    assert reloaded_payload["restart_required"] is True
+    assert config_api.sh.config["deployment"] == {"profile": "advanced"}
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["deployment"] == {
+        "profile": "advanced",
+        "public_url": "https://ob.example",
+    }
+
+    cleared = await mcp.routes[("POST", "/api/config")](
+        JsonRequest({"deployment": {"public_url": ""}, "persist": True})
+    )
+    cleared_payload = _json(cleared)
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert cleared_payload["deployment"]["public_url"] == ""
+    assert persisted["deployment"] == {"profile": "advanced"}
+
+
+@pytest.mark.asyncio
+async def test_dashboard_public_mcp_address_rejects_non_origin_without_mutation(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "config.yaml"
+    original = {"deployment": {"public_url": "https://safe.example"}}
+    config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", dict(original))
+    monkeypatch.setattr(utils, "config_file_path", lambda: str(config_path))
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest(
+            {
+                "deployment": {"public_url": "https://safe.example/other?x=1"},
+                "persist": True,
+            }
+        )
+    )
+
+    assert response.status_code == 400
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original
+    assert config_api.sh.config == original
+
+
+@pytest.mark.asyncio
+async def test_dashboard_public_mcp_address_write_failure_is_not_published_to_runtime(
+    monkeypatch
+):
+    runtime = {"deployment": {"public_url": "https://old.example"}}
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(
+        config_api,
+        "atomic_update_config_yaml",
+        lambda _mutate: (_ for _ in ()).throw(OSError("read-only mount")),
+    )
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest(
+            {
+                "deployment": {"public_url": "https://new.example/mcp"},
+                "persist": True,
+            }
+        )
+    )
+
+    assert response.status_code == 500
+    assert "persist failed" in _json(response)["error"]
+    assert runtime == {"deployment": {"public_url": "https://old.example"}}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"top_k": True},
+        {"top_k": 2.5},
+        {"sample_k": False},
+        {"sample_k": 3.5},
+        {"temperature": True},
+        {"temperature": float("nan")},
+        {"temperature": float("inf")},
+    ],
+)
+@pytest.mark.asyncio
+async def test_sampling_settings_reject_invalid_numeric_values_without_mutation(
+    monkeypatch,
+    body,
+):
+    old_sampling = {
+        "enabled": False,
+        "top_k": 5,
+        "sample_k": 2,
+        "temperature": 0.7,
+    }
+    runtime = {"surfacing": {"sampling": old_sampling}}
+    persist_calls = []
+    monkeypatch.setattr(buckets_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(buckets_web.sh, "config", runtime)
+    monkeypatch.setattr(
+        buckets_web,
+        "atomic_update_config_yaml",
+        lambda mutate: persist_calls.append(mutate),
+    )
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/settings/sampling")](
+        JsonRequest({"top_k": 10, **body})
+    )
+
+    assert response.status_code == 400
+    assert runtime["surfacing"]["sampling"] is old_sampling
+    assert old_sampling == {
+        "enabled": False,
+        "top_k": 5,
+        "sample_k": 2,
+        "temperature": 0.7,
+    }
+    assert persist_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sampling_settings_write_failure_keeps_runtime_unchanged(monkeypatch):
+    old_sampling = {
+        "enabled": False,
+        "top_k": 5,
+        "sample_k": 2,
+        "temperature": 0.7,
+    }
+    runtime = {"surfacing": {"sampling": old_sampling}}
+    monkeypatch.setattr(buckets_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(buckets_web.sh, "config", runtime)
+    monkeypatch.setattr(
+        buckets_web,
+        "atomic_update_config_yaml",
+        lambda _mutate: (_ for _ in ()).throw(OSError("read-only config")),
+    )
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/settings/sampling")](
+        JsonRequest({"enabled": True, "top_k": 10, "temperature": 1.2})
+    )
+
+    assert response.status_code == 500
+    assert runtime["surfacing"]["sampling"] is old_sampling
+    assert old_sampling == {
+        "enabled": False,
+        "top_k": 5,
+        "sample_k": 2,
+        "temperature": 0.7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sampling_settings_persist_before_atomic_runtime_publish(monkeypatch):
+    old_sampling = {
+        "enabled": False,
+        "top_k": 5,
+        "sample_k": 2,
+        "temperature": 0.7,
+    }
+    runtime = {"surfacing": {"sampling": old_sampling}}
+    persisted = {}
+
+    def persist(mutate):
+        assert old_sampling["top_k"] == 5
+        target = {}
+        mutate(target)
+        persisted.update(target)
+        return target
+
+    monkeypatch.setattr(buckets_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(buckets_web.sh, "config", runtime)
+    monkeypatch.setattr(buckets_web, "atomic_update_config_yaml", persist)
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/settings/sampling")](
+        JsonRequest(
+            {
+                "enabled": True,
+                "top_k": "10",
+                "sample_k": "4",
+                "temperature": "1.2",
+            }
+        )
+    )
+
+    assert response.status_code == 200
+    assert runtime["surfacing"]["sampling"] is old_sampling
+    assert old_sampling == {
+        "enabled": True,
+        "top_k": 10,
+        "sample_k": 4,
+        "temperature": 1.2,
+    }
+    assert persisted["surfacing"]["sampling"] == old_sampling
+
+
+def test_sampling_settings_serialize_commit_and_merge_across_event_loops(
+    monkeypatch,
+):
+    old_sampling = {
+        "enabled": False,
+        "top_k": 5,
+        "sample_k": 2,
+        "temperature": 0.7,
+    }
+    runtime = {"surfacing": {"sampling": old_sampling}}
+    persisted = {"surfacing": {"sampling": copy.deepcopy(old_sampling)}}
+    disk_lock = threading.Lock()
+    first_persisted = threading.Event()
+    second_attempting = threading.Event()
+    second_persisted = threading.Event()
+    release_first = threading.Event()
+
+    def persist(mutate):
+        with disk_lock:
+            candidate = copy.deepcopy(persisted)
+            mutate(candidate)
+            persisted.clear()
+            persisted.update(candidate)
+        sampling = candidate["surfacing"]["sampling"]
+        if sampling["temperature"] == 0.7:
+            first_persisted.set()
+            assert release_first.wait(5), "first sampling commit was not released"
+        else:
+            second_persisted.set()
+        return candidate
+
+    monkeypatch.setattr(buckets_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(buckets_web.sh, "config", runtime)
+    monkeypatch.setattr(buckets_web, "atomic_update_config_yaml", persist)
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+    handler = mcp.routes[("POST", "/api/settings/sampling")]
+
+    def invoke(body, attempting=None):
+        if attempting is not None:
+            attempting.set()
+        return asyncio.run(handler(JsonRequest(body)))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(invoke, {"top_k": 10})
+        try:
+            assert first_persisted.wait(3), "first sampling update was not persisted"
+            second = executor.submit(
+                invoke,
+                {"temperature": 1.2},
+                second_attempting,
+            )
+            assert second_attempting.wait(3), "second sampling request did not start"
+            assert not second_persisted.wait(0.5), (
+                "second sampling update persisted before the first runtime publish"
+            )
+        finally:
+            release_first.set()
+        first_response = first.result(timeout=5)
+        second_response = second.result(timeout=5)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    expected = {
+        "enabled": False,
+        "top_k": 10,
+        "sample_k": 2,
+        "temperature": 1.2,
+    }
+    assert persisted["surfacing"]["sampling"] == expected
+    assert runtime["surfacing"]["sampling"] is old_sampling
+    assert old_sampling == expected
+
+
+@pytest.mark.asyncio
+async def test_retired_purge_endpoint_never_deletes_memory(monkeypatch):
+    class ExplodingBucketManager:
+        def __getattr__(self, name):
+            raise AssertionError(f"retired purge endpoint touched bucket manager: {name}")
+
+    monkeypatch.setattr(buckets_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        buckets_web.sh, "bucket_mgr", ExplodingBucketManager(), raising=False
+    )
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/buckets/purge")](
+        JsonRequest({"ids": ["memory-1"]})
+    )
+    payload = _json(response)
+
+    assert response.status_code == 410
+    assert payload["error"] == "physical_deletion_forbidden"
+    assert "Markdown 文件会继续保留" in payload["message"]
