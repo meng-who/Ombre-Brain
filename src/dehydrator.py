@@ -128,11 +128,12 @@ _DEFAULT_IMPORTANCE = 5
 # 视角丢失。压缩本应保密度、不应改人称。下面这条规则注入 system prompt 强制保留：
 #   AI 一方恒用「我」；人类一方一律用其名字称呼（由 config.human 注入）。
 # 禁止 双方 / 对方 / 用户 / TA 等抹掉视角的中性第三人称。
-def _perspective_rule(human: str) -> str:
+def _perspective_rule(human: str, ai_name: str = "AI") -> str:
     return (
         "\n\n【视角铁律——最高优先级，违反即视为压缩失败】\n"
         "以下内容是「我」（AI）以第一人称写下的记忆。压缩/合并只改密度，绝不改人称：\n"
-        f"- AI 自身永远用「我」，不要换成「AI」「助手」「TA」。\n"
+        f"- AI 自身永远用「我」（名字是「{ai_name}」），不要换成自身名字、「AI」「助手」「TA」。\n"
+        f"- 输入里明确写出的「我」就是 AI 自身，必须原样保留为「我」，绝不能改成「{human}」。\n"
         f"- 人类那一方一律称呼「{human}」（原文里的「你/她/他」都指「{human}」，按名字还原）。\n"
         "- 严禁把「我」和「" + human + "」合并成「双方」「彼此」「对方」「用户」等抹掉视角的中性词。\n"
         "- 谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
@@ -176,7 +177,7 @@ DIGEST_PROMPT = """你是一个日记整理专家。她/他会发送一段包含
 
 整理规则：
 1. 每个条目应该是一个独立的主题/事件（不要混在一起）
-2. 为每个条目自动分析元数据
+2. 为每个条目自动分析元数据。标题优先沿用原文明确写出的《标题》、独立首行标题或有辨识度的关键原话；不要把它改写成“确认关系”“进行沟通”“关系变化”等会议纪要式结论
 3. 去除无意义的口水话和重复信息，保留核心内容
 4. 同一主题的零散信息应合并为一个条目
 5. 如果有待办事项，单独提取为一个条目
@@ -187,7 +188,7 @@ DIGEST_PROMPT = """你是一个日记整理专家。她/他会发送一段包含
 输出格式（纯 JSON 数组，无其他内容）：
 [
   {
-    "name": "条目标题（10字以内）",
+    "name": "有辨识度的事件标题（优先原文明确标题或关键原话）",
     "content": "整理后的内容",
     "domain": ["主题域1"],
     "valence": 0.7,
@@ -248,8 +249,9 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    第一步—精准提取：从原文抽取 3~5 个真正的核心词，不泛化、不遗漏
    第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、她/他可能用不同措辞搜索的词
    两步合并为一个 tags 数组，总计 10~15 个
-5. suggested_name（建议桶名）：10字以内的简短标题
-6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+5. suggested_name（建议桶名）：优先逐字沿用原文中的《标题》、独立首行标题或最有辨识度的关键原话（去掉书名号即可）；没有明确候选时才概括。标题应让当事人一眼认出这件事，避免“确认关系”“深入交流”“关系变化”“达成共识”等会议纪要式抽象结论
+6. importance（重要度）：1~10 的整数，根据这件事对长期记忆的实际重要程度判断；普通日常默认靠近 5，只有明确长期影响、承诺或核心边界时才提高
+7. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -257,7 +259,8 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "valence": 0.7,
   "arousal": 0.4,
   "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
-  "suggested_name": "简短标题"
+  "suggested_name": "简短标题",
+  "importance": 5
 }"""
 
 
@@ -302,11 +305,20 @@ class Dehydrator:
         # 思考，关掉它既修了空输出、又更快更省。设为 None 可彻底不发该字段（兼容
         # 不支持 thinkingConfig 的老模型）。
         self.thinking_budget = dehy_cfg.get("thinking_budget", 0)
+        # OpenAI-compatible providers may expose request extensions that are not
+        # part of the OpenAI schema (for example DeepSeek's thinking switch).
+        extra_body = dehy_cfg.get("extra_body")
+        self.extra_body = dict(extra_body) if isinstance(extra_body, dict) else {}
 
         # --- Human display name / 人类一方的称呼 ---
         # 注入脱水/合并的「视角铁律」：原文里人类那一方统一还原为这个名字，
         # 而不是被压成「双方/对方/用户」。与 config.human 同源（前端可改）。
         self.human = config.get("human", "用户") or "用户"
+        self.ai_name = (
+            os.environ.get("AI_NAME", "").strip()
+            or os.environ.get("OMBRE_AI_NAME", "").strip()
+            or "AI"
+        )
 
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
@@ -362,7 +374,7 @@ class Dehydrator:
         prompt 版本、人名、api_format、base_url 和 model 混进 key，换模型或端点后
         下次 breath 会用新配置重新脱水，不会复用旧模型的摘要。"""
         keyed = (
-            f"{_PROMPT_VERSION}|{self.human}|{self.api_format}|"
+            f"{_PROMPT_VERSION}|{self.human}|{self.ai_name}|{self.api_format}|"
             f"{self.base_url.rstrip('/')}|{self.model}|{content}"
         )
         return hashlib.sha256(keyed.encode()).hexdigest()
@@ -493,6 +505,7 @@ class Dehydrator:
             ],
             max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
             temperature=temperature if temperature is not None else self.temperature,
+            extra_body=self.extra_body or None,
         )
         if not response.choices:
             return ""
@@ -734,7 +747,7 @@ class Dehydrator:
         调用 LLM API 执行智能脱水。
         """
         return await self._chat(
-            DEHYDRATE_PROMPT + _perspective_rule(self.human),
+            DEHYDRATE_PROMPT + _perspective_rule(self.human, self.ai_name),
             content[:_DEHYDRATE_INPUT_LIMIT],
         )
 
@@ -751,7 +764,9 @@ class Dehydrator:
             f"旧记忆：\n{old_content[:_MERGE_INPUT_LIMIT]}\n\n"
             f"新内容：\n{new_content[:_MERGE_INPUT_LIMIT]}"
         )
-        return await self._chat(MERGE_PROMPT + _perspective_rule(self.human), user_msg)
+        return await self._chat(
+            MERGE_PROMPT + _perspective_rule(self.human, self.ai_name), user_msg
+        )
 
     # ---------------------------------------------------------
     # Output formatting
@@ -850,7 +865,7 @@ class Dehydrator:
         Analyze content and return structured metadata.
         分析内容，返回结构化元数据。
 
-        Returns: {"domain", "valence", "arousal", "tags", "suggested_name"}
+        Returns: {"domain", "valence", "arousal", "tags", "suggested_name", "importance"}
         """
         if not content or not content.strip():
             return self._default_analysis()
@@ -908,6 +923,13 @@ class Dehydrator:
 
         # --- Validate and clamp value ranges / 校验并钳制数值范围 ---
         valence, arousal = self._clamp_va(result)
+        try:
+            importance = max(
+                _IMPORTANCE_MIN,
+                min(_IMPORTANCE_MAX, int(result.get("importance", _DEFAULT_IMPORTANCE))),
+            )
+        except (TypeError, ValueError, OverflowError):
+            importance = _DEFAULT_IMPORTANCE
 
         return {
             "domain": result.get("domain", ["未分类"])[:_DOMAIN_MAX],
@@ -915,6 +937,7 @@ class Dehydrator:
             "arousal": arousal,
             "tags": result.get("tags", [])[:_TAGS_MAX],
             "suggested_name": str(result.get("suggested_name", ""))[:_NAME_MAX_CHARS],
+            "importance": importance,
         }
 
     # ---------------------------------------------------------
@@ -932,6 +955,7 @@ class Dehydrator:
             "arousal": _DEFAULT_AROUSAL,
             "tags": [],
             "suggested_name": "",
+            "importance": _DEFAULT_IMPORTANCE,
         }
 
     # ---------------------------------------------------------
@@ -972,7 +996,7 @@ class Dehydrator:
         调用 LLM API 执行日记整理。
         """
         raw = await self._chat(
-            DIGEST_PROMPT + _perspective_rule(self.human),
+            DIGEST_PROMPT + _perspective_rule(self.human, self.ai_name),
             content[:_DIGEST_INPUT_LIMIT],
             max_tokens=_DIGEST_MAX_TOKENS,
             temperature=_DIGEST_TEMPERATURE,
@@ -1063,6 +1087,7 @@ class Dehydrator:
             return text
 
         ai_names = [
+            str(getattr(self, "ai_name", "") or "").strip(),
             os.environ.get("AI_NAME", "").strip(),
             os.environ.get("OMBRE_AI_NAME", "").strip(),
         ]
@@ -1082,11 +1107,11 @@ class Dehydrator:
             escaped_ai = re.escape(ai_name)
             replacements = (
                 (rf"我\s*和\s*{escaped_ai}", f"我和{human}"),
-                (rf"{escaped_ai}\s*和\s*我", f"{human}和我"),
+                (rf"{escaped_ai}\s*和\s*我", f"我和{human}"),
                 (rf"我\s*跟\s*{escaped_ai}", f"我跟{human}"),
-                (rf"{escaped_ai}\s*跟\s*我", f"{human}跟我"),
+                (rf"{escaped_ai}\s*跟\s*我", f"我跟{human}"),
                 (rf"我\s*与\s*{escaped_ai}", f"我与{human}"),
-                (rf"{escaped_ai}\s*与\s*我", f"{human}与我"),
+                (rf"{escaped_ai}\s*与\s*我", f"我与{human}"),
                 (rf"与\s*{escaped_ai}(?=[\u4e00-\u9fffA-Za-z0-9])", f"与{human}"),
                 (rf"和\s*{escaped_ai}(?=[\u4e00-\u9fffA-Za-z0-9])", f"和{human}"),
                 (rf"跟\s*{escaped_ai}(?=[\u4e00-\u9fffA-Za-z0-9])", f"跟{human}"),
@@ -1095,7 +1120,7 @@ class Dehydrator:
                 text = re.sub(pattern, replacement, text)
             text = re.sub(
                 rf"(?<![{joiners}]){escaped_ai}(?=\s*测试)",
-                human,
+                "我",
                 text,
             )
         return text
@@ -1110,6 +1135,23 @@ class Dehydrator:
             return text
         for reference in ("作者", "当事人", "提问者", "该用户"):
             text = text.replace(reference, subject)
+        if subject in {"我", "我们", "咱们", "俺", "咱"}:
+            human = self.human
+            if isinstance(human, dict):
+                human = human.get("name", "")
+            human = str(human or "").strip()
+            if human and human != "用户":
+                escaped_human = re.escape(human)
+                text = re.sub(
+                    rf"{escaped_human}\s*([和跟与])\s*{re.escape(subject)}",
+                    rf"{subject}\1{human}",
+                    text,
+                )
+                text = re.sub(
+                    rf"^(\s*){escaped_human}(?=[\u4e00-\u9fffA-Za-z0-9])",
+                    rf"\1{subject}",
+                    text,
+                )
         return text
 
     def _infer_source_subject(self, source_content: str) -> str:
