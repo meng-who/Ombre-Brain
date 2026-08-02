@@ -4,13 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from dehydrator import Dehydrator
+from dehydrator import Dehydrator, _perspective_rule
 import tools.grow.core as grow_core_module
 
 
 def _parser(human: str = "Melissa") -> Dehydrator:
     parser = Dehydrator.__new__(Dehydrator)
     parser.human = human
+    parser.ai_name = "Cy"
     return parser
 
 
@@ -35,6 +36,51 @@ def test_digest_recovers_leading_title_and_first_person(monkeypatch):
 
     assert items[0]["name"] == "与Melissa测试OB新版"
     assert items[0]["content"] == "我确认 grow 不应该改写主语。"
+
+
+def test_digest_restores_leading_first_person_from_source(monkeypatch):
+    monkeypatch.setenv("AI_NAME", "Cy")
+    raw = json.dumps([
+        {
+            "name": "新版整理",
+            "content": "Melissa整理了新版 OB 的测试结果。",
+            "domain": ["AI"],
+            "tags": ["grow"],
+        }
+    ], ensure_ascii=False)
+
+    items = _parser()._parse_digest(
+        raw,
+        source_content="我整理了新版 OB 的测试结果。",
+    )
+
+    assert items[0]["content"] == "我整理了新版 OB 的测试结果。"
+
+
+def test_digest_normalizes_human_and_ai_pair_to_ai_first(monkeypatch):
+    monkeypatch.setenv("AI_NAME", "Cy")
+    raw = json.dumps([
+        {
+            "name": "一起测试",
+            "content": "Melissa和我一起测试了新版 OB。",
+            "domain": ["AI"],
+            "tags": ["grow"],
+        }
+    ], ensure_ascii=False)
+
+    items = _parser()._parse_digest(
+        raw,
+        source_content="我和Cy一起测试了新版 OB。",
+    )
+
+    assert items[0]["content"] == "我和Melissa一起测试了新版 OB。"
+
+
+def test_perspective_rule_forbids_rewriting_first_person_as_human():
+    rule = _perspective_rule("Melissa", "Cy")
+
+    assert "名字是「Cy」" in rule
+    assert "绝不能改成「Melissa」" in rule
 
 
 @pytest.mark.asyncio

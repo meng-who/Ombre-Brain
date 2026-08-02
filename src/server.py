@@ -8,7 +8,7 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime �
 web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
-- 启动后暴露 14 个 MCP 工具：breath/breath_search/breath_advanced/hold/grow/
+- 启动后暴露 15 个 MCP 工具：breath/breath_search/breath_advanced/hold/grow/source_read/
   trace/anchor/release/pulse/plan/letter_write/letter_read/dream/I；每个入口
   ≤ 10 行，只负责转发。breath 拆成 breath()(0 参数)+breath_search(3 参数)+
   breath_advanced(9 参数) 三级，是因为 claude.ai 按需加载工具时会跳过参数
@@ -23,7 +23,7 @@ web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/too
 - 不写 HTTP 路由处理（全在 web/* 下）；不写 LLM prompt（dehydrator 负责）
 - 不直接读写桶文件（bucket_manager 负责）
 
-对外暴露：mcp 单实例 + 14 个 @mcp.tool() 函数；HTTP 路由在 src/web/*
+对外暴露：mcp 单实例 + 15 个 @mcp.tool() 函数；HTTP 路由在 src/web/*
 ========================================
 """
 
@@ -47,6 +47,8 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from ombrebrain.storage.embedding_outbox import EmbeddingOutbox
+from ombrebrain.storage.source_store import SourceStore
+from ombrebrain.security.deployment_profile import enforce_mcp_network_guard
 from import_memory import ImportEngine
 from migrate_engine import MigrateEngine
 from utils import get_version, load_config, setup_logging
@@ -59,6 +61,7 @@ from tools import _runtime as _tools_runtime
 from tools import breath as _t_breath
 from tools import hold as _t_hold
 from tools import grow as _t_grow
+from tools import source_read as _t_source_read
 from tools import trace as _t_trace
 from tools import anchor as _t_anchor
 from tools import plan as _t_plan
@@ -187,6 +190,7 @@ try:
         begin_warnings,
         pop_warnings,
         format_warnings_suffix,
+        PublicToolError,
     )
 except ImportError:
     from .errors import (  # type: ignore
@@ -198,6 +202,7 @@ except ImportError:
         begin_warnings,
         pop_warnings,
         format_warnings_suffix,
+        PublicToolError,
     )
 configure_errors_path(config.get("buckets_dir", "buckets"))
 
@@ -213,6 +218,13 @@ except RuntimeError as _emb_err:
     logger.error(f"[STARTUP FAILED] {_emb_err}")
     raise SystemExit(f"Ombre Brain 启动中止：{_emb_err}") from _emb_err
 bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
+_source_max_bytes = int(
+    (config.get("limits") or {}).get("max_grow_input_bytes", 2 * 1024 * 1024)
+)
+source_store = SourceStore(
+    config.get("buckets_dir", "buckets"),
+    max_bytes=_source_max_bytes,
+)
 embedding_outbox = EmbeddingOutbox(config, bucket_mgr, embedding_engine)
 bucket_mgr.attach_embedding_outbox(embedding_outbox)
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
@@ -230,6 +242,7 @@ github_sync_instance: GitHubSync | None = (
         repo=_gh_cfg.get("repo", ""),
         branch=_gh_cfg.get("branch", "main"),
         path_prefix=_gh_cfg.get("path_prefix", "ombre"),
+        max_source_bytes=_source_max_bytes,
     )
     if _gh_token and _gh_cfg.get("repo")
     else None
@@ -301,7 +314,7 @@ _gh_auto_interval: int = int(_gh_cfg.get("auto_interval_minutes") or 0)
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
 #
-# iter 2.2 后对外只有单连接器 /mcp。2.8.5 起 14 个工具全部直接注册到
+# iter 2.2 后对外只有单连接器 /mcp。当前 15 个工具全部直接注册到
 # 这一实例，不再依赖 FastMCP 私有注册表的启动期合并，导入式 ASGI 启动也能
 # 稳定暴露完整工具清单。
 #
@@ -325,6 +338,33 @@ mcp = FastMCP(
 # =============================================================
 import web as _web
 import web._shared as _wsh
+
+# 注册 OAuth 路由和 MCP 中间件之前统一评估真实网络边界，供启动日志与
+# Dashboard 诊断使用。风险评估不得覆盖明确的 mcp_require_auth 配置。
+_mcp_network_security = enforce_mcp_network_guard(
+    config,
+    environment=os.environ,
+    in_docker=_wsh.in_docker(),
+)
+if _mcp_network_security["guard_active"]:
+    logger.error(
+        "=" * 60 + "\n"
+        "🛡️  MCP 安全门禁已启用：检测到非回环或无法确认边界的免鉴权配置。\n"
+        "    当前进程已在内存中强制开启 MCP 鉴权，config.yaml 原值未被改写。\n"
+        "    原因：%s\n"
+        "    请改用 OAuth/静态 Token，或把服务明确限制到本机回环地址。\n"
+        + "=" * 60,
+        _mcp_network_security["reason"],
+    )
+elif _mcp_network_security["override_active"]:
+    logger.critical(
+        "=" * 60 + "\n"
+        "⚠️  已显式允许非回环免鉴权 MCP：任何能访问该端口的人都可读写记忆。\n"
+        "    原因：%s\n"
+        "    不再需要时请立即删除 OMBRE_ALLOW_INSECURE_MCP。\n"
+        + "=" * 60,
+        _mcp_network_security["reason"],
+    )
 _wsh.init(config)
 # 记忆持久性自检：容器里记忆目录若没挂持久卷，重建就全丢。开机就醒目告警，别让用户
 # 以为「存住了其实没有」。只提示不阻断（阻断会伤部署）。
@@ -403,7 +443,7 @@ _wsh.init_runtime(
 
 # =============================================================
 # 结构化操作日志 helpers（任务A，2026-05-03）
-# 给 14 个 MCP 工具入口统一打 entry/ok/err 三段日志，便于排查
+# 给 15 个 MCP 工具入口统一打 entry/ok/err 三段日志，便于排查
 # 客户端报 invalid_arguments / 静默错误等问题。
 # 输出格式：op=<name> phase=entry|ok|err key=value...
 # 所有可能含 PII 的字段（content / 信件正文等）只记 length，不记内容。
@@ -463,6 +503,8 @@ def _log_op_err(op: str, exc: BaseException) -> None:
 
 def _safe_exception_detail(exc: BaseException) -> str:
     """异常对外或持久化前只保留类型与泛化说明。"""
+    if isinstance(exc, PublicToolError):
+        return f"{_safe_exception_type(exc)}: {exc.public_message}"
     return (
         f"{_safe_exception_type(exc)}: 工具执行失败；"
         "异常正文已隐藏，以保护密钥、本机路径与调用内容。"
@@ -554,6 +596,7 @@ _tools_runtime.init(
     embedding_engine=embedding_engine,
     embedding_outbox=embedding_outbox,
     import_engine=import_engine,
+    source_store=source_store,
     logger=logger,
     fire_webhook=_fire_webhook,
     mark_op=_mark_op,
@@ -676,6 +719,7 @@ async def breath_advanced(
 @mcp.tool()
 async def hold(
     content: str,
+    title: Optional[str] = "",
     tags: Optional[str] = "",
     importance: Optional[int] = 5,
     pinned: Optional[bool] = False,
@@ -688,17 +732,17 @@ async def hold(
     media: Optional[list | str] = None,
     test_data: Optional[bool] = False,
 ) -> str:
-    """仅在对话中已明确决定“这段内容值得成为长期记忆”时调用；不要因普通聊天、猜测或工具名称联想而自行调用。存入一条一句话级记忆，content 必须保留原意和事实，不得先改写成摘要；OB 的 hold 路径也绝不会压缩正文。系统优先自动打标，API 不可用时使用本地中性元数据继续逐字保存。tags 逗号分隔,importance 1-10。pinned=True=标记为永久核心,不衰减不合并。feel=True=存为感受类记忆(不参与普通浮现,仅通过 feel 检索读取)。source_bucket=正在消化的原始记忆桶 ID,会被标为已消化以加速淡化。why_remembered=记录原因(可选,自由文本,仅用于展示不计分)。meaning=可选,这条记忆为什么值得被想起——不是摘要,是我自己的话,只在真正觉得有重量时才写,不必每次都写。每次传入的是新增的一条,系统自动追加到该桶的 meaning 列表,不会覆盖已有的。media=可选,可传服务器可读的单个临时路径，或列表；列表项使用 path，或使用 data_base64+filename，如 [{"data_base64":"...","filename":"photo.png","type":"image/png"}]。媒体会先复制到 OB 持久媒体目录，Markdown 只记录稳定路径；无法读取的临时路径会明确报错，绝不保存失效引用。"""
+    """仅在对话中已明确决定“这段内容值得成为长期记忆”时调用；不要因普通聊天、猜测或工具名称联想而自行调用。content 逐字保存，绝不压缩。title 可选；传入时是最终显式标题，优先于打标模型建议。系统自动补其余元数据，API 不可用时使用本地中性值继续保存。tags 逗号分隔，importance 1-10。pinned=True 标记为永久核心；feel=True 存为感受类记忆。source_bucket 是正在消化的原始记忆桶 ID。why_remembered 与 meaning 是可选的第一人称记录原因。media 可传服务器可读路径或 data_base64+filename 列表项。"""
     return await _with_notice(
         _t_hold.dispatch(
-            content=content, tags=tags, importance=importance,
+            content=content, title=title, tags=tags, importance=importance,
             pinned=pinned, feel=feel, source_bucket=source_bucket,
             valence=valence, arousal=arousal, why_remembered=why_remembered,
             meaning=meaning, media=media, test_data=test_data,
         ),
         op="hold",
         args={
-            "content_len": len(content or ""), "tags": tags,
+            "content_len": len(content or ""), "title_len": len(title or ""), "tags": tags,
             "importance": importance, "pinned": pinned, "feel": feel,
             "source_bucket": source_bucket, "valence": valence, "arousal": arousal,
             "why_len": len(why_remembered or ""), "meaning_len": len(meaning or ""),
@@ -712,11 +756,38 @@ async def hold(
 async def grow(content: str = "", items: Optional[list] = None) -> str:
     """仅在对话中已明确要求整理并写入长期记忆时调用，不要根据普通聊天自行推断写入意图。整理一段长文本(如一天的记录/一段日记/一篇总结)存入记忆,系统拆分为 2~6 条独立事件桶并各自尝试合并。短内容(<30 字)走 hold 单条快速路径,不强行拆分。
 
-    进阶(可选):若你(上层 AI)已经把长文拆成了 N 条最终正文,传 items=[条1, 条2, ...](字符串列表)即可**逐字入库**——跳过系统的二次拆分与改写,每条正文一字不动,只自动补元数据(领域/情感/标签/命名);合并到老桶也用原文追加、不再压缩。你有完整对话上下文,拆分和表述质量比只看二手长文的内部模型更高,能避免反复压缩带来的失真。传了 items 就忽略 content;不传则按上面的默认行为整段整理。"""
+    进阶(可选):若你已经把长文拆成 N 条最终正文，可传字符串 items，或对象 items=[{"title":"最终标题","content":"最终正文","tags":["中文短标签"],"importance":5,"domain":["恋爱"],"valence":0.8,"arousal":0.4,"source_ranges":[[1,20]]}]。显式字段优先于自动打标，正文逐字入库，合并时也不压缩。同时传 content 时，content 是整批共享的隐藏原文证据，只保存一次；source_ranges 使用 1-based 闭区间把每个桶连回自己的原文片段。"""
     return await _with_notice(
         _t_grow.dispatch(content, items=items),
         op="grow",
         args={"content_len": len(content or ""), "items": len(items or [])},
+    )
+
+
+@mcp.tool()
+async def source_read(
+    bucket_id: str,
+    expected_title: str,
+    scope: str = "event",
+    cursor: int = 0,
+    max_tokens: int = 6000,
+) -> str:
+    """显式读取一个记忆桶对应的原文证据。必须同时给出精确 bucket_id 与该桶的显式 title；不做语义搜索、不扩散到相关桶、不调用模型。scope=event 只读该事件声明的行范围，scope=full_source 读取整份共享原文。内容过长时返回 next_cursor，继续以同一桶和标题分页读取。"""
+    return await _with_notice(
+        _t_source_read.dispatch(
+            bucket_id=bucket_id,
+            expected_title=expected_title,
+            scope=scope,
+            cursor=cursor,
+            max_tokens=max_tokens,
+        ),
+        op="source_read",
+        args={
+            "bucket_id": bucket_id,
+            "scope": scope,
+            "cursor": cursor,
+            "max_tokens": max_tokens,
+        },
     )
 
 
@@ -964,6 +1035,7 @@ for _strict_tool_name in (
     "breath_advanced",
     "hold",
     "grow",
+    "source_read",
     "dream",
     "anchor",
     "release",
@@ -1015,8 +1087,7 @@ for _strict_tool_name in (
 
 # ============================================================
 # OAuth 2.0 — MCP Remote Auth —— 已拆分到 web/oauth.py（路由在其 register 内注册）。
-# 这里把启动期 MCP 鉴权中间件要用的两个校验函数 import 回来：mcp_auth_mode=="oauth"（默认）
-# 用 _is_valid_mcp_token，mcp_auth_mode=="token" 用 _is_valid_static_mcp_token，二选一注入中间件。
+# 这里把启动期 MCP 鉴权中间件要用的两个校验函数 import 回来；hybrid 会同时注入。
 # ============================================================
 from web.oauth import _is_valid_mcp_token, _is_valid_static_mcp_token  # noqa: F401
 
@@ -1067,15 +1138,21 @@ if __name__ == "__main__":
             if _http_settings.auth_mode == "token"
             else _is_valid_mcp_token
         )
+        _mcp_static_token_validator = (
+            _is_valid_static_mcp_token
+            if _http_settings.auth_mode == "hybrid"
+            else None
+        )
         _app = build_http_app(
             mcp,
             transport,
             settings=_http_settings,
             token_validator=_mcp_token_validator,
             lifecycle=_runtime_lifecycle,
+            static_token_validator=_mcp_static_token_validator,
         )
         if transport == "streamable-http":
-            logger.info("MCP 单连接器 /mcp：14 个工具统一对外暴露")
+            logger.info("MCP 单连接器 /mcp：15 个工具统一对外暴露")
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
         logger.info(
             "MCP request body limit: %s",
@@ -1098,6 +1175,14 @@ if __name__ == "__main__":
                 "    定期轮换该 Token。\n"
                 + "=" * 60
             )
+        elif _mcp_auth_required and _http_settings.auth_mode == "hybrid":
+            logger.info("MCP OAuth + 静态 Token 共存鉴权已启用")
+            logger.warning(
+                "=" * 60 + "\n"
+                "⚠️  共存模式保留 OAuth，同时接受预置静态 Token；静态 Token 等同万能密钥。\n"
+                "    请仅向受信任客户端分发并定期轮换，不要提交到仓库或截图分享。\n"
+                + "=" * 60
+            )
         elif _mcp_auth_required:
             logger.info("MCP OAuth middleware enabled / MCP OAuth 中间件已启用")
         else:
@@ -1106,9 +1191,9 @@ if __name__ == "__main__":
             logger.warning(
                 "=" * 60 + "\n"
                 "⚠️  MCP 认证已关闭 (mcp_require_auth: false)：/mcp 无需任何令牌即可直连，\n"
-                "    14 个记忆工具全部对外开放——任何能访问本端口的人都能读写你的全部记忆。\n"
-                "    本服务监听 0.0.0.0，若端口暴露到局域网/公网，请务必用反代鉴权、防火墙\n"
-                "    或仅绑定 127.0.0.1 保护；仅在可信内网/本机自有前端场景才建议关闭鉴权。\n"
+                "    15 个记忆工具全部对外开放——任何能访问本端口的人都能读写你的全部记忆。\n"
+                f"    本服务进程监听 {_BIND_HOST}，若端口暴露到局域网/公网，请务必用反代鉴权、防火墙\n"
+                "    或仅绑定 127.0.0.1 保护；免鉴权只建议用于已确认的本机回环连接。\n"
                 + "=" * 60
             )
         # 端口口径澄清（用户反馈：Docker 与裸机端口容易混淆）。容器内固定监听 8000，
@@ -1134,9 +1219,13 @@ if __name__ == "__main__":
             _endpoint_path,
             (
                 "开启(需静态 Token)" if _http_settings.auth_mode == "token"
-                else "开启(需 OAuth Bearer)"
+                else (
+                    "开启(OAuth 或静态 Token)"
+                    if _http_settings.auth_mode == "hybrid"
+                    else "开启(需 OAuth Bearer)"
+                )
             ) if _mcp_auth_required
-            else "关闭(免 token 直连，仅限可信内网/本机)",
+            else "关闭(免 token 直连，仅限本机回环/显式高风险豁免)",
         )
         # Forwarded headers are validated inside the application against
         # OMBRE_TRUSTED_PROXY_CIDRS.  Uvicorn's default proxy middleware rewrites
@@ -1149,5 +1238,5 @@ if __name__ == "__main__":
             proxy_headers=False,
         )
     else:
-        # stdio：14 个工具已直接注册在唯一 mcp 实例上，这里直接运行即可。
+        # stdio：15 个工具已直接注册在唯一 mcp 实例上，这里直接运行即可。
         mcp.run(transport=transport)
