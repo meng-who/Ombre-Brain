@@ -7,8 +7,8 @@
     },
     {
       "path": "frontend/dashboard.html",
-      "sha256": "4ac0708fef188acc2f523b31a60453520144e601c4b86a8598f60b3a24b4936c",
-      "size": 526976
+      "sha256": "857a16bb9d48a8e8fc4c2039513650bc03a1d877d462c7ead52009631acd9469",
+      "size": 527337
     },
     {
       "path": "frontend/favicon.svg",
@@ -52,8 +52,8 @@
     },
     {
       "path": "src/dehydrator.py",
-      "sha256": "ca3af5a0fee8ae9e9e4775fc6018413a9a1601a507f5425fe162412f8b02316c",
-      "size": 54979
+      "sha256": "fa3faab6de4ab942300ea0707b65b95ac1a1a35c011aa3d0f2cc76f8242b1e0d",
+      "size": 61161
     },
     {
       "path": "src/embedding_engine.py",
@@ -847,8 +847,8 @@
     },
     {
       "path": "src/tools/grow/core.py",
-      "sha256": "4574f1563363f33368483dad8a093c9b356379954e6383e45f8f5c5a1c385e12",
-      "size": 12275
+      "sha256": "86625bd0d0704f9619558abad21d991ef18fbdbd82b1a3cb9ca597b5791afa21",
+      "size": 12328
     },
     {
       "path": "src/tools/grow/shortpath.py",
@@ -937,8 +937,8 @@
     },
     {
       "path": "src/web/buckets.py",
-      "sha256": "da12ab4dd7f41cd9175b56652f7885bcd3702ef12dbd59fb04e6f57a99b261e1",
-      "size": 49357
+      "sha256": "6ad85a54ca2a625850e1f15bd2783a99d5786b79bb3141fea24b64cab48d4726",
+      "size": 51191
     },
     {
       "path": "src/web/config_api.py",
