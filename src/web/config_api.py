@@ -40,6 +40,11 @@ from ombrebrain.security.public_origin import configured_public_origin
 from . import _shared as sh
 
 try:
+    from dehydrator import chat_completion_token_limit
+except ImportError:  # pragma: no cover
+    from ..dehydrator import chat_completion_token_limit
+
+try:
     from utils import (  # type: ignore
         get_ai_name as _get_ai_name,
         get_owner_name as _get_owner_name,
@@ -958,7 +963,11 @@ def register(mcp) -> None:
         try:
             import httpx as _httpx
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                **chat_completion_token_limit(model, 5),
+            }
             async with _httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(f"{base_url.rstrip('/')}/chat/completions", json=payload, headers=headers)
             if r.status_code in (200, 201):
@@ -1406,17 +1415,18 @@ def register(mcp) -> None:
         return JSONResponse(response)
 
 
-    # --- 传输模式热切换：streamable-http / stdio / sse（legacy）---
-    # transport 是「启动时绑定」的（server.py 据此起 streamable_http_app / sse_app / stdio），
+    # --- 传输模式热切换：streamable-http / stdio ---
+    # transport 是「启动时绑定」的（server.py 据此起 streamable_http_app / stdio），
     # 运行中无法无缝切换，所以这里的做法是：持久化新值 → 原地自重启（os.execv 继承已改的
     # os.environ，绕过 compose 里硬编码的旧 OMBRE_TRANSPORT）→ 新进程按新 transport 起。
-    _TRANSPORT_CHOICES = ("streamable-http", "sse", "stdio")
+    # 2026-08-09 起 legacy SSE（"sse"）已下线，不再是可选项。
+    _TRANSPORT_CHOICES = ("streamable-http", "stdio")
 
     @mcp.custom_route("/api/transport", methods=["POST"])
     async def api_transport_set(request: Request) -> Response:
         """切换 MCP 传输模式并自重启生效。
 
-        Body (JSON): {"transport": "streamable-http" | "sse" | "stdio"}
+        Body (JSON): {"transport": "streamable-http" | "stdio"}
 
         ⚠️ stdio 没有 HTTP 服务：切到 stdio 后 Dashboard / REST / /mcp(HTTP) 全部消失，
         且无法再从网页切回（需在服务器改 config.yaml / env 恢复）。前端对此二次确认。
