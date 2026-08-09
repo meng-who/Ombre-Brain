@@ -92,6 +92,20 @@ def author_side(author: object, *, ai_name: str | None = None) -> str | None:
     return None
 
 
+def _is_ai_letter(bucket: dict, *, ai_name: str | None = None) -> bool:
+    meta = bucket.get("metadata") or {}
+    author = str(meta.get("author") or "").strip()
+    if author_side(author, ai_name=ai_name) == "ai":
+        return True
+    writer_name = str(meta.get("writer_name") or "").strip()
+    configured_ai = str(ai_name or get_ai_name() or "").strip()
+    if configured_ai and writer_name == configured_ai:
+        return True
+    if meta.get("locked_by") == "ai" and writer_name:
+        return True
+    return False
+
+
 def resolve_writer_name(
     caller_side: str,
     *,
@@ -475,8 +489,7 @@ async def letter_read(
             letters = [b for b in letters if b["metadata"].get("author") == "user"]
         elif af_low in ("ai", "claude") or af == ai:
             # AI 侧：匹配新署名 ai_name + 历史遗留的 "claude"
-            ai_aliases = {ai, "claude"}
-            letters = [b for b in letters if b["metadata"].get("author") in ai_aliases]
+            letters = [b for b in letters if _is_ai_letter(b, ai_name=ai)]
         else:
             # 任意自定义署名：精确匹配存储值
             letters = [b for b in letters if b["metadata"].get("author") == af]

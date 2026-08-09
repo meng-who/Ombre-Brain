@@ -59,6 +59,38 @@ async def test_old_and_none_letters_remain_readable_and_proxy_write_compatible(b
 
 
 @pytest.mark.asyncio
+async def test_letter_read_ai_filter_matches_stored_ai_writer_name(
+    bucket_mgr, monkeypatch
+):
+    monkeypatch.delenv("AI_NAME", raising=False)
+    install_runtime(bucket_mgr)
+    ai_letter = await bucket_mgr.create(
+        content="Cy-side letter body",
+        bucket_type="letter",
+        domain=["letter"],
+    )
+    await bucket_mgr.update(
+        ai_letter,
+        author="Cy",
+        writer_name="Cy",
+        locked_by="ai",
+        lock_type="none",
+        title="Cy-side letter",
+    )
+    human_letter = await bucket_mgr.create(
+        content="human-side letter body",
+        bucket_type="letter",
+        domain=["letter"],
+    )
+    await bucket_mgr.update(human_letter, author="user", title="human-side letter")
+
+    output = await letter_read(author="ai", limit=10)
+
+    assert "Cy-side letter body" in output
+    assert "human-side letter body" not in output
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lock_type", ["timed", "permanent"])
 async def test_mcp_creates_locked_letter_owned_by_ai_without_echoing_content(
     bucket_mgr, monkeypatch, lock_type
