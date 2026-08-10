@@ -95,8 +95,11 @@ def author_side(author: object, *, ai_name: str | None = None) -> str | None:
 def _is_ai_letter(bucket: dict, *, ai_name: str | None = None) -> bool:
     meta = bucket.get("metadata") or {}
     author = str(meta.get("author") or "").strip()
-    if author_side(author, ai_name=ai_name) == "ai":
+    side = author_side(author, ai_name=ai_name)
+    if side == "ai":
         return True
+    if side == "human":
+        return False
     writer_name = str(meta.get("writer_name") or "").strip()
     configured_ai = str(ai_name or get_ai_name() or "").strip()
     if configured_ai and writer_name == configured_ai:
