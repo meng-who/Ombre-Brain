@@ -87,6 +87,29 @@ async def test_source_read_requires_exact_bucket_and_title(
 
 
 @pytest.mark.asyncio
+async def test_source_read_accepts_dashboard_shortened_display_title(
+    bucket_mgr, monkeypatch
+):
+    store = SourceStore(bucket_mgr.base_dir)
+    ref = store.put("line one\nsource evidence for shortened title\nline three\n")
+    full_title = "Ombre Brain系统更新与Cy的记忆测试继续顺利推进"
+    display_title = "Ombre Brain系统更新与Cy的"
+    bucket_id = await bucket_mgr.create(
+        content="summary",
+        title=full_title,
+        source_refs=[{"ref": ref, "ranges": [[2, 2]]}],
+    )
+    await bucket_mgr.update(bucket_id, name=f"2026-08-09 12-34-56 {display_title}")
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr, raising=False)
+    monkeypatch.setattr(rt, "source_store", store, raising=False)
+
+    result = await source_read(bucket_id, display_title, scope="event")
+
+    assert "source evidence for shortened title" in result
+    assert f"title={full_title}" in result
+
+
+@pytest.mark.asyncio
 async def test_source_read_pages_without_silent_truncation(bucket_mgr, monkeypatch):
     store = SourceStore(bucket_mgr.base_dir)
     original = "段落内容。" * 3000

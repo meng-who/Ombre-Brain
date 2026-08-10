@@ -43,6 +43,46 @@ def _single_line_header_value(value: object) -> str:
     return "".join(output)
 
 
+def _display_title_candidate(value: object) -> str:
+    text = str(value or "").strip()
+    prefix = text[:19]
+    if (
+        len(prefix) == 19
+        and prefix[4] == "-"
+        and prefix[7] == "-"
+        and prefix[10] == " "
+        and prefix[13] in "-:"
+        and prefix[16] in "-:"
+    ):
+        text = text[19:].strip()
+    else:
+        prefix = text[:10]
+        if (
+            len(prefix) == 10
+            and prefix[4] == "-"
+            and prefix[7] == "-"
+        ):
+            text = text[10:].strip()
+    return _normalized_title(text)
+
+
+def _title_matches_expected(expected: str, candidates: list[object]) -> bool:
+    expected = _normalized_title(expected)
+    normalized = [
+        item
+        for item in dict.fromkeys(_normalized_title(candidate) for candidate in candidates)
+        if item
+    ]
+    if expected in normalized:
+        return True
+    if len(expected) < 8:
+        return False
+    return any(
+        candidate.startswith(expected) or expected.startswith(candidate)
+        for candidate in normalized
+    )
+
+
 def _collect_evidence_window(
     source_store: Any,
     source_refs: list[dict[str, Any]],
@@ -147,7 +187,16 @@ async def dispatch(
     actual_title = _normalized_title(metadata.get("title"))
     if not actual_title:
         return "该桶没有可供精确校验的显式标题，拒绝读取原文。"
-    if expected_title != actual_title:
+    if not _title_matches_expected(
+        expected_title,
+        [
+            actual_title,
+            metadata.get("name"),
+            bucket.get("name"),
+            _display_title_candidate(metadata.get("name")),
+            _display_title_candidate(bucket.get("name")),
+        ],
+    ):
         return "标题不匹配，拒绝读取原文。请使用该桶的精确 title。"
 
     try:

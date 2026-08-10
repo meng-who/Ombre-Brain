@@ -27,7 +27,7 @@
 我有十五种能力，全部在一个 MCP 连接器 `/mcp` 里：
 
 - **高频 8 个**：`breath` / `breath_search` / `breath_advanced` / `hold` / `grow` / `source_read` / `dream` / `trace`
-- **低频 7 个**：`anchor` / `release` / `pulse` / `plan` / `letter_write` / `letter_read` / `I`
+- **低频 8 个**：`anchor` / `release` / `pulse` / `plan` / `letter_write` / `letter_lock_update` / `letter_read` / `I`
 
 连上 `/mcp` 就拥有全部十五种能力。
 
@@ -110,11 +110,17 @@
 
 **`anchor` 字段不在 trace 里**——切换 anchor 必须走专门的 `anchor()` / `release()`，受 24 上限保护。
 
-#### `dream(window_hours=48)` — 我做梦消化
+#### `dream(window_hours=48, inspiration=False)` — 我做梦消化
 
 **不是义务**。`breath()` 之后如果你或对方觉得有东西需要消化，再调。没什么消化的就不调。
 
 我会读取窗口内有变动的所有桶（默认 48 小时，clamp 1~336），完整正文不截断；候选超过 40 个时按衰减分截断到前 40。末尾会附上你的所有 active plans 和按 token 预算折叠的 feel 历史。如果有相似度 >0.7 的多条 feel 聚集，我会提示你「可能是结晶时刻」（要不要升级为 pinned）。
+
+只有本轮确实需要灵感材料时才显式传 `inspiration=True`。它不会增加第 16 个工具，也不会由
+hook、后台任务或低检索命中自动开启。开启后最多追加三个只读、仅本次响应有效的材料/问题
+候选；每条带来源、原文哈希、片段跨度、待核查的共享结构、不对应处和假设。候选不写回、
+不 touch，不是事实、当前立场、行动建议或工具许可；向量不可用或没有合格配对时宁可返回
+无候选，也不回退到随机/未过滤记忆。当前模型可以忽略、修改、反驳或另行读取来源。
 
 **梦里你能做三件事**：
 1. **能放下的** → `trace(id, resolved=1)`
@@ -153,15 +159,20 @@
 
 `release` 只是从 anchor 状态退出，pinned/importance 不变，桶恢复正常浮现资格。
 
-#### `letter_write(author, content, ...)` / `letter_read(...)` — 我写信、读信
+#### `letter_write(...)` / `letter_read(...)` / `letter_lock_update(...)` — 我写信、读信、管理锁
 
 - `letter_write(author="claude", content="...", title="...")` — 我写给她他。
 - `letter_write(author="user", content="...", user_name="...")` — 把她他写给我的留下。
 - `author="user"` 表示用户侧，`author="ai"`（或与 `ai_name` 相同）表示 AI 侧；也可以直接传任意自定义署名字符串，读取时可用同一署名过滤。
 - `letter_read()` — 按时间倒序读最近 10 封。
 - `letter_read(query="那次离开后", author="claude")` — 语义检索 + 方向过滤。
+- `letter_write(..., lock_type="timed", unlock_date="2026-08-12T20:00:00+08:00")` — 写一封定时锁信；必须使用未来且带时区的时间。
+- `letter_write(..., lock_type="permanent")` — 写一封无自动解锁时间的锁信。
+- `letter_lock_update(letter_id="...", lock_type="none")` — 锁拥有者提前解锁；也可在 `timed` / `permanent` 间切换。
 
-**信件原文永久保留，不压缩、不合并、不衰减**。普通 breath 不会浮信件，但 `/breath-hook`（SessionStart）会自动把双方各最新一封带给我。
+带锁 Letter 必须由当前可信入口所属的一方亲自录入；`author` 只是署名，不能改变锁所有权。锁住时，对方的读取、SessionStart 和语义搜索都不会得到标题、正文、摘要或命中片段；锁拥有者仍可正常读取和搜索。**信件原文永久保留，不压缩、不合并、不衰减**。
+
+时间锁不是加密：能直接访问 vault Markdown 或宿主机文件的人仍能读取原文。
 
 #### `I(content, aspect, read, limit)` — 我认识我自己
 
