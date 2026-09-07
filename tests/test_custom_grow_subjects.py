@@ -17,17 +17,20 @@ def _parser(human: str = "Melissa") -> Dehydrator:
 
 def test_digest_recovers_leading_title_and_first_person(monkeypatch):
     monkeypatch.setenv("AI_NAME", "Cy")
-    raw = json.dumps([
-        {
-            "name": "",
-            "content": "标题：与Cy测试OB新版\n作者确认 grow 不应该改写主语。",
-            "domain": ["AI"],
-            "tags": ["grow"],
-            "importance": 6,
-            "valence": 0.5,
-            "arousal": 0.4,
-        }
-    ], ensure_ascii=False)
+    raw = json.dumps(
+        [
+            {
+                "name": "",
+                "content": "标题：与Cy测试OB新版\n作者确认 grow 不应该改写主语。",
+                "domain": ["AI"],
+                "tags": ["grow"],
+                "importance": 6,
+                "valence": 0.5,
+                "arousal": 0.4,
+            }
+        ],
+        ensure_ascii=False,
+    )
 
     items = _parser()._parse_digest(
         raw,
@@ -40,14 +43,17 @@ def test_digest_recovers_leading_title_and_first_person(monkeypatch):
 
 def test_digest_restores_leading_first_person_from_source(monkeypatch):
     monkeypatch.setenv("AI_NAME", "Cy")
-    raw = json.dumps([
-        {
-            "name": "新版整理",
-            "content": "Melissa整理了新版 OB 的测试结果。",
-            "domain": ["AI"],
-            "tags": ["grow"],
-        }
-    ], ensure_ascii=False)
+    raw = json.dumps(
+        [
+            {
+                "name": "新版整理",
+                "content": "Melissa整理了新版 OB 的测试结果。",
+                "domain": ["AI"],
+                "tags": ["grow"],
+            }
+        ],
+        ensure_ascii=False,
+    )
 
     items = _parser()._parse_digest(
         raw,
@@ -59,14 +65,17 @@ def test_digest_restores_leading_first_person_from_source(monkeypatch):
 
 def test_digest_normalizes_human_and_ai_pair_to_ai_first(monkeypatch):
     monkeypatch.setenv("AI_NAME", "Cy")
-    raw = json.dumps([
-        {
-            "name": "一起测试",
-            "content": "Melissa和我一起测试了新版 OB。",
-            "domain": ["AI"],
-            "tags": ["grow"],
-        }
-    ], ensure_ascii=False)
+    raw = json.dumps(
+        [
+            {
+                "name": "一起测试",
+                "content": "Melissa和我一起测试了新版 OB。",
+                "domain": ["AI"],
+                "tags": ["grow"],
+            }
+        ],
+        ensure_ascii=False,
+    )
 
     items = _parser()._parse_digest(
         raw,
@@ -103,6 +112,11 @@ async def test_grow_content_uses_raw_merge(monkeypatch):
         grow_core_module.rt,
         "logger",
         SimpleNamespace(error=lambda *_args, **_kwargs: None, warning=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        grow_core_module.rt,
+        "source_store",
+        SimpleNamespace(put=lambda _content: "source-ref"),
     )
     captured = {}
 

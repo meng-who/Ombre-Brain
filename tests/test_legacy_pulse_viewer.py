@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from starlette.requests import Request
 
 import web.buckets as buckets_web
 
@@ -59,8 +60,20 @@ class FakeDecayEngine:
         return float(metadata.get("importance", 0))
 
 
+def pulse_request(token="test-pulse-token"):
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/pulse",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_legacy_pulse_keeps_pages_contract_and_recent_order(monkeypatch):
+    monkeypatch.setenv("OMBRE_PULSE_TOKEN", "test-pulse-token")
     monkeypatch.setattr(
         buckets_web.sh,
         "bucket_mgr",
@@ -76,10 +89,32 @@ async def test_legacy_pulse_keeps_pages_contract_and_recent_order(monkeypatch):
     mcp = FakeMCP()
     buckets_web.register(mcp)
 
-    response = await mcp.routes[("GET", "/api/pulse")](object())
+    response = await mcp.routes[("GET", "/api/pulse")](pulse_request())
     payload = json.loads(response.body.decode("utf-8"))
 
     assert response.status_code == 200
     assert payload["stats"] == {"total": 2}
     assert [bucket["id"] for bucket in payload["buckets"]] == ["newer", "older"]
     assert payload["buckets"][0]["content"] == "Newer memory"
+
+
+@pytest.mark.asyncio
+async def test_legacy_pulse_fails_closed_without_configured_token(monkeypatch):
+    monkeypatch.delenv("OMBRE_PULSE_TOKEN", raising=False)
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes[("GET", "/api/pulse")](pulse_request())
+
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_legacy_pulse_rejects_wrong_token(monkeypatch):
+    monkeypatch.setenv("OMBRE_PULSE_TOKEN", "test-pulse-token")
+    mcp = FakeMCP()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes[("GET", "/api/pulse")](pulse_request("wrong"))
+
+    assert response.status_code == 401

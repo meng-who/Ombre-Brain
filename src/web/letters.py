@@ -19,7 +19,10 @@ from . import _shared as sh
 from tools._common import check_content_size, check_metadata_size
 from tools.plan.core import (
     author_side,
+    is_letter_bucket,
+    letter_lock_revision,
     letter_lock_state,
+    normalize_expired_lock,
     normalize_lock_type,
     normalize_unlock_date,
     resolve_writer_name,
@@ -62,7 +65,7 @@ def register(mcp) -> None:
             return JSONResponse({"error": metadata_error}, status_code=400)
         try:
             all_b = await sh.bucket_mgr.list_all(include_archive=False)
-            letters = [b for b in all_b if b["metadata"].get("type") == "letter"]
+            letters = [b for b in all_b if is_letter_bucket(b)]
             if author:
                 af_low = author.lower()
                 if af_low == "user":
@@ -76,14 +79,23 @@ def register(mcp) -> None:
                 key=lambda b: b["metadata"].get("letter_date") or b["metadata"].get("created", ""),
                 reverse=True,
             )
+            store = getattr(sh, "deletion_requests", None)
+            deletion_statuses = store.status_snapshot() if store else {}
             result = []
             for b in letters:
                 state = letter_lock_state(b, "human")
                 if state["expired"]:
-                    await sh.bucket_mgr.update(
-                        b["id"], lock_type="none", unlock_date=None
+                    b, state = await normalize_expired_lock(
+                        b,
+                        state,
+                        "human",
+                        bucket_mgr=sh.bucket_mgr,
                     )
-                result.append(safe_letter_metadata(b, "human"))
+                    if not b:
+                        continue
+                item = safe_letter_metadata(b, "human")
+                item["deletion_request"] = deletion_statuses.get(str(b["id"]))
+                result.append(item)
             return JSONResponse({"letters": result, "total": len(result)})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
@@ -228,8 +240,9 @@ def register(mcp) -> None:
             return err
         letter_id = request.path_params["letter_id"]
         bucket = await sh.bucket_mgr.get(letter_id)
-        if not bucket or bucket["metadata"].get("type") != "letter":
+        if not bucket or not is_letter_bucket(bucket):
             return JSONResponse({"error": "letter not found"}, status_code=404)
+        expected_lock_state = letter_lock_revision(bucket)
         try:
             body = await sh._read_json_object(request)
         except Exception:
@@ -284,8 +297,15 @@ def register(mcp) -> None:
                     writer_name=ai_writer_name,
                     lock_type="none",
                     unlock_date=None,
+                    expected_lock_state=expected_lock_state,
                 )
                 if not ok:
+                    latest = await sh.bucket_mgr.get(letter_id)
+                    if latest and letter_lock_revision(latest) != expected_lock_state:
+                        return JSONResponse(
+                            {"error": "letter lock changed concurrently"},
+                            status_code=409,
+                        )
                     return JSONResponse({"error": "conversion failed"}, status_code=500)
                 return JSONResponse({
                     "ok": True,
@@ -330,8 +350,18 @@ def register(mcp) -> None:
             if not updates:
                 return JSONResponse({"error": "nothing to update"}, status_code=400)
             try:
-                ok = await sh.bucket_mgr.update(letter_id, **updates)
+                ok = await sh.bucket_mgr.update(
+                    letter_id,
+                    expected_lock_state=expected_lock_state,
+                    **updates,
+                )
                 if not ok:
+                    latest = await sh.bucket_mgr.get(letter_id)
+                    if latest and letter_lock_revision(latest) != expected_lock_state:
+                        return JSONResponse(
+                            {"error": "letter lock changed concurrently"},
+                            status_code=409,
+                        )
                     return JSONResponse({"error": "update failed"}, status_code=500)
                 if "content" in updates:
                     try:
@@ -374,8 +404,18 @@ def register(mcp) -> None:
         updates = {"lock_type": lock_type, "unlock_date": unlock_date}
 
         try:
-            ok = await sh.bucket_mgr.update(letter_id, **updates)
+            ok = await sh.bucket_mgr.update(
+                letter_id,
+                expected_lock_state=expected_lock_state,
+                **updates,
+            )
             if not ok:
+                latest = await sh.bucket_mgr.get(letter_id)
+                if latest and letter_lock_revision(latest) != expected_lock_state:
+                    return JSONResponse(
+                        {"error": "letter lock changed concurrently"},
+                        status_code=409,
+                    )
                 return JSONResponse({"error": "update failed"}, status_code=500)
             return JSONResponse({
                 "ok": True,
@@ -399,34 +439,19 @@ def register(mcp) -> None:
             return JSONResponse({"error": "confirm=true required for delete-to-archive"}, status_code=400)
         letter_id = request.path_params["letter_id"]
         bucket = await sh.bucket_mgr.get(letter_id)
-        if bucket and bucket["metadata"].get("type") != "letter":
+        if bucket and not is_letter_bucket(bucket):
             return JSONResponse({"error": "letter not found"}, status_code=404)
         try:
-            # Idempotent repair for a half-deleted letter: the Markdown file may
-            # already be gone while the active cache/vector still exposes it.
-            # Archive a real letter when present, then independently clean every
-            # derived layer even when no file remains.
-            archived = bool(bucket) and await sh.bucket_mgr.delete(letter_id)
-            if bucket and not archived:
-                return JSONResponse({"error": "letter archive failed"}, status_code=500)
-            outbox = getattr(sh.bucket_mgr, "embedding_outbox", None)
-            if outbox is not None:
-                try:
-                    outbox.discard(letter_id)
-                except Exception:
-                    pass
             try:
-                sh.embedding_engine.delete_embedding(letter_id)
+                body = await sh._read_json_object(request)
             except Exception:
-                pass
-            invalidate = getattr(sh.bucket_mgr, "_invalidate_bm25", None)
-            if callable(invalidate):
-                invalidate()
-            return JSONResponse({
-                "ok": True,
-                "deleted": archived,
-                "cleaned": True,
-                "already_missing": not bool(bucket),
-            })
+                body = {}
+            result = await sh.deletion_requests.submit(
+                letter_id, body.get("reason", ""), is_letter=True
+            )
+            if not result.get("ok"):
+                status = 404 if result.get("code") == "not_found" else 409 if result.get("code") in {"pending_exists", "daily_limit", "lifetime_limit"} else 400
+                return JSONResponse(result, status_code=status)
+            return JSONResponse(result)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)

@@ -112,6 +112,7 @@
   <!-- API URL config -->
   <div class="config-bar">
     <input class="config-input" id="apiUrl" type="text" placeholder="输入你的 Ombre Brain URL，例如 https://xxx.onrender.com">
+    <input class="config-input" id="pulseToken" type="password" autocomplete="current-password" placeholder="Pulse Token">
     <button class="config-btn" onclick="connectAndLoad()">连接</button>
   </div>
 
@@ -171,14 +172,19 @@ function displayName(b) {
 // ==================== DATA ====================
 async function connectAndLoad() {
   let url = document.getElementById("apiUrl").value.trim();
+  const token = document.getElementById("pulseToken").value.trim();
   if (!url) { alert("\u8bf7\u8f93\u5165 URL"); return }
+  if (!token) { alert("\u8bf7\u8f93\u5165 Pulse Token"); return }
   if (url.endsWith("/")) url = url.slice(0, -1);
   API_BASE = url;
   localStorage.setItem("ombre_api_url", url);
+  localStorage.setItem("ombre_pulse_token", token);
 
   showLoading();
   try {
-    const resp = await fetch(API_BASE + "/api/pulse");
+    const resp = await fetch(API_BASE + "/api/pulse", {
+      headers: {Authorization: "Bearer " + token}
+    });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
@@ -327,8 +333,10 @@ document.getElementById("search").addEventListener("input", renderGrid);
 
 // Auto-load saved URL
 const savedUrl = localStorage.getItem("ombre_api_url");
-if (savedUrl) {
-  document.getElementById("apiUrl").value = savedUrl;
+const savedToken = localStorage.getItem("ombre_pulse_token");
+if (savedUrl) document.getElementById("apiUrl").value = savedUrl;
+if (savedToken) document.getElementById("pulseToken").value = savedToken;
+if (savedUrl && savedToken) {
   connectAndLoad();
 }
 </script>
