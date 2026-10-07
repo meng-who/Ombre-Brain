@@ -186,6 +186,9 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
             "一封上锁的信"
             if letter_locked else meta.get("name", "") or ""
         )
+        title = meta.get("title") or ""
+        if not letter_locked and title and title not in name:
+            name = title
         name_tag = f" 《{name}》" if name and name != b["id"] else ""
         anchor_tag = (
             " ⚓ [anchor]"

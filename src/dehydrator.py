@@ -38,7 +38,14 @@ from typing import Optional
 
 from openai import AsyncOpenAI
 
-from utils import clean_llm_json, count_tokens_approx, parse_bool, positive_float
+from utils import (
+    MEMORY_TITLE_MAX_CHARS,
+    clean_llm_json,
+    count_tokens_approx,
+    normalize_memory_title,
+    parse_bool,
+    positive_float,
+)
 
 from ombrebrain.integrations.provider_detect import (
     is_gemini_native_host,
@@ -110,11 +117,20 @@ _DEFAULT_AROUSAL = 0.3  # 0=完全平静, 1=极激动
 # --- 输出截断长度 ---
 _TAGS_MAX = 15           # tags 最多保留几个
 _DOMAIN_MAX = 3          # domain 最多保留几个（rule.md 推荐选 1~2 个）
-_NAME_MAX_CHARS = 20     # suggested_name 上限
 _PLAN_REASON_MAX = 200   # plan 判定 reason 上限
 _SAME_EVENT_REASON_MAX = 200  # 合并边界判定 reason 上限
 _PARSE_ERR_PREVIEW = 200  # JSON 解析失败时日志中 raw 预览长度
 _WHY_REMEMBERED_MAX_CHARS = 500
+
+
+def _generated_title(value: object) -> str:
+    """Keep model titles intact; ignore invalid ones instead of saving half a title."""
+    try:
+        return normalize_memory_title(value)
+    except ValueError:
+        logger.warning("Generated title exceeds %s characters; omitting title", MEMORY_TITLE_MAX_CHARS)
+        return ""
+
 
 # --- importance 范围（与哲学边界一致）---
 _IMPORTANCE_MIN = 1
@@ -196,7 +212,7 @@ DIGEST_PROMPT = """你是一个日记整理专家。她/他会发送一段包含
 
 整理规则：
 1. 每个条目应该是一个独立的主题/事件（不要混在一起）
-2. 为每个条目自动分析元数据。标题优先沿用原文明确写出的《标题》、独立首行标题或有辨识度的关键原话；不要把它改写成“确认关系”“进行沟通”“关系变化”等会议纪要式结论
+2. 为每个条目自动分析元数据。标题优先沿用原文明确写出的《标题》、独立首行标题或有辨识度的关键原话；不要把它改写成“确认关系”“进行沟通”“关系变化”等会议纪要式结论。标题应完整且不超过120字符，超出时重新概括，不能截断半句话
 3. 去除无意义的口水话和重复信息，保留核心内容
 4. 同一主题的零散信息应合并为一个条目
 5. 如果有待办事项，单独提取为一个条目
@@ -278,7 +294,7 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    第一步—精准提取：从原文抽取 3~5 个真正的核心词，不泛化、不遗漏
    第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、她/他可能用不同措辞搜索的词
    两步合并为一个 tags 数组，总计 10~15 个
-5. suggested_name（建议桶名）：优先逐字沿用原文中的《标题》、独立首行标题或最有辨识度的关键原话（去掉书名号即可）；没有明确候选时才概括。标题应让当事人一眼认出这件事，避免“确认关系”“深入交流”“关系变化”“达成共识”等会议纪要式抽象结论
+5. suggested_name（建议桶名）：优先逐字沿用原文中的《标题》、独立首行标题或最有辨识度的关键原话（去掉书名号即可）；没有明确候选时才概括。标题应让当事人一眼认出这件事，避免“确认关系”“深入交流”“关系变化”“达成共识”等会议纪要式抽象结论；完整标题不超过120字符，超出时重新概括，不能截断半句话
 6. importance（重要度）：1~10 的整数，根据这件事对长期记忆的实际重要程度判断；普通日常默认靠近 5，只有明确长期影响、承诺或核心边界时才提高
 7. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
 
@@ -1053,7 +1069,7 @@ class Dehydrator:
             "valence": valence,
             "arousal": arousal,
             "tags": result.get("tags", [])[:_TAGS_MAX],
-            "suggested_name": str(result.get("suggested_name", ""))[:_NAME_MAX_CHARS],
+            "suggested_name": _generated_title(result.get("suggested_name", "")),
             "importance": importance,
             "why_remembered": why_remembered,
         }
@@ -1202,14 +1218,14 @@ class Dehydrator:
                 else ""
             )
 
-            cleaned_name = self._repair_ai_self_reference(raw_name)
+            cleaned_name = _generated_title(self._repair_ai_self_reference(raw_name))
             cleaned_content = self._clean_digest_pronouns(
                 raw_content, source_content=source_content
             )
             cleaned_content = self._repair_ai_self_reference(cleaned_content)
 
             validated.append({
-                "name": cleaned_name[:_NAME_MAX_CHARS],
+                "name": cleaned_name,
                 "content": cleaned_content,
                 "domain": item.get("domain", ["未分类"])[:_DOMAIN_MAX],
                 "valence": valence,
